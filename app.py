@@ -1,4 +1,4 @@
- from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import sqlite3
 from datetime import datetime
