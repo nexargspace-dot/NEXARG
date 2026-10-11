@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, abort
 from flask_cors import CORS
 import sqlite3
 from datetime import datetime
@@ -15,6 +15,33 @@ CORS(app, resources={r"/api/*": {
 }})
 DB = 'nmstudio.db'
 ORDERS_DIR = 'pedidos'
+
+# ------------------------------------------------------------
+# TIENDAS: cada plantilla con carrito tiene sus propias tablas
+# (<slug>_productos, <slug>_pedidos, <slug>_pedido_items).
+# Para sumar una plantilla nueva: agregarla acá y listo.
+# Solo se aceptan los slugs de esta lista, así el nombre de tabla
+# que se arma en las consultas nunca viene "crudo" del usuario.
+# ------------------------------------------------------------
+TIENDAS = {
+    'aurea':  {'prefijo_pedido': 'AR', 'marca': 'Aurea'},
+    'lumina': {'prefijo_pedido': 'LU', 'marca': 'Lumina'},
+}
+
+def tienda_o_404(slug):
+    if slug not in TIENDAS:
+        abort(404)
+    return slug
+
+def seed_productos(marca):
+    return [
+        ('prod-01', 'Champú Reparador', 9500, 10, 'assets/prod-01.png', 'Limpieza profunda y reparación capilar.'),
+        ('prod-02', 'Sérum Nutritivo', 12800, 10, 'assets/prod-02.png', 'Producto exclusivo de nuestra línea boutique profesional.'),
+        ('prod-03', 'Máscara Intensiva', 14200, 10, 'assets/prod-03.png', 'Nutrición intensa para cabellos secos o dañados.'),
+        ('prod-04', 'Aceite Capilar', 11200, 10, 'assets/prod-04.jpg', 'Brillo y suavidad sin dejar sensación pesada.'),
+        ('prod-05', 'Crema de Peinar', 8700, 10, 'assets/prod-05.png', 'Control de frizz y definición para todo tipo de cabello.'),
+        ('prod-06', f'Kit Viaje {marca}', 16500, 10, 'assets/prod-06.png', 'Tus esenciales en tamaño ideal para llevar a todos lados.')
+    ]
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -59,32 +86,38 @@ def init_db():
         nombre TEXT,
         precio INTEGER
     );
-    CREATE TABLE IF NOT EXISTS aurea_productos (
-        id TEXT PRIMARY KEY,
-        nombre TEXT NOT NULL,
-        precio INTEGER NOT NULL DEFAULT 0,
-        stock INTEGER NOT NULL DEFAULT 0,
-        imagen TEXT,
-        descripcion TEXT
-    );
-    CREATE TABLE IF NOT EXISTS aurea_pedidos (
-        id TEXT PRIMARY KEY,
-        cliente_nombre TEXT NOT NULL,
-        cliente_gmail TEXT,
-        cliente_telefono TEXT,
-        total INTEGER NOT NULL DEFAULT 0,
-        estado TEXT NOT NULL,
-        creado TEXT NOT NULL,
-        historial TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS aurea_pedido_items (
-        pedido_id TEXT NOT NULL,
-        producto_id TEXT NOT NULL,
-        nombre TEXT NOT NULL,
-        cantidad INTEGER NOT NULL,
-        precio_unitario INTEGER NOT NULL
-    );
     """)
+
+    # Tablas de cada tienda (aurea_*, lumina_*)
+    for t in TIENDAS:
+        conn.executescript(f"""
+        CREATE TABLE IF NOT EXISTS {t}_productos (
+            id TEXT PRIMARY KEY,
+            nombre TEXT NOT NULL,
+            precio INTEGER NOT NULL DEFAULT 0,
+            stock INTEGER NOT NULL DEFAULT 0,
+            imagen TEXT,
+            descripcion TEXT
+        );
+        CREATE TABLE IF NOT EXISTS {t}_pedidos (
+            id TEXT PRIMARY KEY,
+            cliente_nombre TEXT NOT NULL,
+            cliente_gmail TEXT,
+            cliente_telefono TEXT,
+            total INTEGER NOT NULL DEFAULT 0,
+            estado TEXT NOT NULL,
+            creado TEXT NOT NULL,
+            historial TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS {t}_pedido_items (
+            pedido_id TEXT NOT NULL,
+            producto_id TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            cantidad INTEGER NOT NULL,
+            precio_unitario INTEGER NOT NULL
+        );
+        """)
+
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(pedidos)").fetchall()}
     new_columns = {
         'plantilla_id': 'TEXT',
@@ -99,29 +132,24 @@ def init_db():
     for name, column_type in new_columns.items():
         if name not in existing_columns:
             conn.execute(f"ALTER TABLE pedidos ADD COLUMN {name} {column_type}")
-    if conn.execute("SELECT COUNT(*) FROM aurea_productos").fetchone()[0] == 0:
-        conn.executemany(
-            "INSERT INTO aurea_productos (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?)",
-            [
-                ('prod-01', 'Champú Reparador', 9500, 10, 'assets/prod-01.png', 'Limpieza profunda y reparación capilar.'),
-                ('prod-02', 'Sérum Nutritivo', 12800, 10, 'assets/prod-02.png', 'Producto exclusivo de nuestra línea boutique profesional.'),
-                ('prod-03', 'Máscara Intensiva', 14200, 10, 'assets/prod-03.png', 'Nutrición intensa para cabellos secos o dañados.'),
-                ('prod-04', 'Aceite Capilar', 11200, 10, 'assets/prod-04.jpg', 'Brillo y suavidad sin dejar sensación pesada.'),
-                ('prod-05', 'Crema de Peinar', 8700, 10, 'assets/prod-05.png', 'Control de frizz y definición para todo tipo de cabello.'),
-                ('prod-06', 'Kit Viaje Aurea', 16500, 10, 'assets/prod-06.png', 'Tus esenciales en tamaño ideal para llevar a todos lados.')
-            ]
-        )
-    # Cargar las 4 plantillas reales
-    count = conn.execute("SELECT COUNT(*) FROM plantillas").fetchone()[0]
-    if count == 0:
-        plantillas = [
-            ('peluqueria-aurea','Aurea - Salón de Belleza','servicios','peluqueria',355000,'$355.000','turnos','./plantillas/peluqueria/01-peluqueria/assets/img-hero.png','Diseño exclusivo para peluquerías'),
-            ('minimal-studio','Minimal Studio','inmobiliarias','alquileres',352000,'$352.000','inmobiliaria','https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=600&q=80&auto=format&fit=crop','Enfoque minimalista para galerías'),
-            ('boutique-concept','Boutique Concept','comercios','cosmeticos',348000,'$348.000','mayorista','https://images.unsplash.com/photo-1441986300917-64674bd600d8?w=600&q=80&auto=format&fit=crop','Ideal para indumentaria y catálogo visual'),
-            ('plantilla-4','Nueva Plantilla 4','gastronomia','resto',355000,'$355.000','ecommerce','./plantillas/nueva-4/assets/foto-principal.jpg','Descripción corta de la web'),
-        ]
-        conn.executemany("INSERT INTO plantillas VALUES (?,?,?,?,?,?,?,?,?)", plantillas)
-        print("4 Plantillas cargadas!")
+
+    # Productos de arranque de cada tienda
+    for t, cfg in TIENDAS.items():
+        if conn.execute(f"SELECT COUNT(*) FROM {t}_productos").fetchone()[0] == 0:
+            conn.executemany(
+                f"INSERT INTO {t}_productos (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?)",
+                seed_productos(cfg['marca'])
+            )
+
+    # Cargar las plantillas del catálogo (las que ya existen se saltean)
+    plantillas = [
+        ('peluqueria-aurea','Aurea - Salón de Belleza','servicios','peluqueria',310000,'$310.000','turnos','./plantillas/peluqueria/01-peluqueria/assets/img-hero.png','Diseño exclusivo para peluquerías'),
+        ('peluqueria-lumina','Lumina - Salón de Belleza','servicios','peluqueria',312000,'$312.000','turnos','./plantillas/peluqueria/02-peluqueria/assets/03.jpg','Diseño oscuro y editorial para salones de belleza'),
+        ('minimal-studio','Minimal Studio','inmobiliarias','alquileres',352000,'$352.000','inmobiliaria','https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=600&q=80&auto=format&fit=crop','Enfoque minimalista para galerías'),
+        ('boutique-concept','Boutique Concept','comercios','cosmeticos',348000,'$348.000','mayorista','https://images.unsplash.com/photo-1441986300917-64674bd600d8?w=600&q=80&auto=format&fit=crop','Ideal para indumentaria y catálogo visual'),
+        ('plantilla-4','Nueva Plantilla 4','gastronomia','resto',355000,'$355.000','ecommerce','./plantillas/nueva-4/assets/foto-principal.jpg','Descripción corta de la web'),
+    ]
+    conn.executemany("INSERT OR IGNORE INTO plantillas VALUES (?,?,?,?,?,?,?,?,?)", plantillas)
     conn.commit()
     conn.close()
     print("DB lista!")
@@ -171,8 +199,13 @@ def get_plantillas():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
-@app.route('/api/aurea/productos', methods=['GET', 'PUT'])
-def aurea_productos():
+# ------------------------------------------------------------
+# PRODUCTOS POR TIENDA:  /api/aurea/productos  /api/lumina/productos
+# ------------------------------------------------------------
+@app.route('/api/<tienda>/productos', methods=['GET', 'PUT'])
+def tienda_productos(tienda):
+    t = tienda_o_404(tienda)
+    tabla = f'{t}_productos'
     conn = get_db()
     if request.method == 'PUT':
         data = request.get_json(silent=True) or {}
@@ -190,7 +223,7 @@ def aurea_productos():
                 if not product_id or not name or price < 0 or stock < 0:
                     raise ValueError('Producto, precio o stock inválido.')
                 conn.execute(
-                    "INSERT INTO aurea_productos (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?) "
+                    f"INSERT INTO {tabla} (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?) "
                     "ON CONFLICT(id) DO UPDATE SET nombre=excluded.nombre, precio=excluded.precio, stock=excluded.stock, "
                     "imagen=excluded.imagen, descripcion=excluded.descripcion",
                     (product_id, name, price, stock, str(item.get('imagen') or ''), str(item.get('descripcion') or ''))
@@ -202,21 +235,29 @@ def aurea_productos():
             return jsonify({'error': str(error)}), 400
         conn.close()
         return jsonify({'ok': True})
-    rows = conn.execute("SELECT * FROM aurea_productos ORDER BY id").fetchall()
+    rows = conn.execute(f"SELECT * FROM {tabla} ORDER BY id").fetchall()
     conn.close()
     return jsonify([dict(row) for row in rows])
 
-@app.route('/api/aurea/pedidos', methods=['GET', 'POST'])
-def aurea_pedidos():
+# ------------------------------------------------------------
+# PEDIDOS POR TIENDA:  /api/aurea/pedidos  /api/lumina/pedidos
+# ------------------------------------------------------------
+@app.route('/api/<tienda>/pedidos', methods=['GET', 'POST'])
+def tienda_pedidos(tienda):
+    t = tienda_o_404(tienda)
+    t_productos = f'{t}_productos'
+    t_pedidos = f'{t}_pedidos'
+    t_items = f'{t}_pedido_items'
+    prefijo = TIENDAS[t]['prefijo_pedido']
     conn = get_db()
     if request.method == 'GET':
         orders = []
-        for row in conn.execute("SELECT * FROM aurea_pedidos ORDER BY creado DESC").fetchall():
+        for row in conn.execute(f"SELECT * FROM {t_pedidos} ORDER BY creado DESC").fetchall():
             order = dict(row)
             order['productos'] = [
                 dict(item) for item in conn.execute(
-                    "SELECT producto_id AS id, nombre, cantidad AS qty, precio_unitario AS precio "
-                    "FROM aurea_pedido_items WHERE pedido_id=?",
+                    f"SELECT producto_id AS id, nombre, cantidad AS qty, precio_unitario AS precio "
+                    f"FROM {t_items} WHERE pedido_id=?",
                     (row['id'],)
                 ).fetchall()
             ]
@@ -241,29 +282,30 @@ def aurea_pedidos():
             quantity = int(item.get('qty') or 0)
             if not product_id or quantity <= 0:
                 raise ValueError('Producto o cantidad inválida.')
-            product = conn.execute("SELECT * FROM aurea_productos WHERE id=?", (product_id,)).fetchone()
+            product = conn.execute(f"SELECT * FROM {t_productos} WHERE id=?", (product_id,)).fetchone()
             if not product:
                 raise ValueError('Producto no encontrado.')
             if product['stock'] < quantity:
                 conn.rollback()
+                conn.close()
                 return jsonify({'error': f'Sin stock suficiente para {product["nombre"]}.'}), 409
             normalized.append((product, quantity))
             total += product['precio'] * quantity
 
-        order_id = f"AR-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(2).upper()}"
+        order_id = f"{prefijo}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(2).upper()}"
         now = datetime.now().isoformat()
         conn.execute(
-            "INSERT INTO aurea_pedidos (id, cliente_nombre, cliente_gmail, cliente_telefono, total, estado, creado, historial) "
+            f"INSERT INTO {t_pedidos} (id, cliente_nombre, cliente_gmail, cliente_telefono, total, estado, creado, historial) "
             "VALUES (?,?,?,?,?,?,?,?)",
             (order_id, name, str(client.get('gmail') or '').strip(), str(client.get('telefono') or '').strip(),
              total, 'NUEVO', now, 'NUEVO')
         )
         for product, quantity in normalized:
             conn.execute(
-                "INSERT INTO aurea_pedido_items (pedido_id, producto_id, nombre, cantidad, precio_unitario) VALUES (?,?,?,?,?)",
+                f"INSERT INTO {t_items} (pedido_id, producto_id, nombre, cantidad, precio_unitario) VALUES (?,?,?,?,?)",
                 (order_id, product['id'], product['nombre'], quantity, product['precio'])
             )
-            conn.execute("UPDATE aurea_productos SET stock=stock-? WHERE id=?", (quantity, product['id']))
+            conn.execute(f"UPDATE {t_productos} SET stock=stock-? WHERE id=?", (quantity, product['id']))
         conn.commit()
         conn.close()
         return jsonify({'id': order_id, 'total': total, 'estado': 'NUEVO'}), 201
@@ -276,8 +318,12 @@ def aurea_pedidos():
         conn.close()
         raise
 
-@app.route('/api/aurea/pedidos/<order_id>/estado', methods=['PUT'])
-def aurea_cambiar_estado(order_id):
+@app.route('/api/<tienda>/pedidos/<order_id>/estado', methods=['PUT'])
+def tienda_cambiar_estado(tienda, order_id):
+    t = tienda_o_404(tienda)
+    t_productos = f'{t}_productos'
+    t_pedidos = f'{t}_pedidos'
+    t_items = f'{t}_pedido_items'
     data = request.get_json(silent=True) or {}
     new_status = str(data.get('estado') or '').strip().upper()
     allowed = {'NUEVO', 'CONFIRMADO', 'ENTREGADO', 'CANCELADO'}
@@ -285,7 +331,7 @@ def aurea_cambiar_estado(order_id):
         return jsonify({'error': 'Estado inválido.'}), 400
     conn = get_db()
     conn.execute('BEGIN IMMEDIATE')
-    row = conn.execute("SELECT estado, historial FROM aurea_pedidos WHERE id=?", (order_id,)).fetchone()
+    row = conn.execute(f"SELECT estado, historial FROM {t_pedidos} WHERE id=?", (order_id,)).fetchone()
     if not row:
         conn.rollback()
         conn.close()
@@ -295,10 +341,10 @@ def aurea_cambiar_estado(order_id):
         conn.close()
         return jsonify({'error': 'Un pedido cancelado no puede reabrirse.'}), 409
     if new_status == 'CANCELADO' and row['estado'] != 'CANCELADO':
-        for item in conn.execute("SELECT producto_id, cantidad FROM aurea_pedido_items WHERE pedido_id=?", (order_id,)).fetchall():
-            conn.execute("UPDATE aurea_productos SET stock=stock+? WHERE id=?", (item['cantidad'], item['producto_id']))
+        for item in conn.execute(f"SELECT producto_id, cantidad FROM {t_items} WHERE pedido_id=?", (order_id,)).fetchall():
+            conn.execute(f"UPDATE {t_productos} SET stock=stock+? WHERE id=?", (item['cantidad'], item['producto_id']))
     history = f"{row['historial']} -> {new_status}"
-    conn.execute("UPDATE aurea_pedidos SET estado=?, historial=? WHERE id=?", (new_status, history, order_id))
+    conn.execute(f"UPDATE {t_pedidos} SET estado=?, historial=? WHERE id=?", (new_status, history, order_id))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
@@ -385,4 +431,4 @@ def cambiar_estado(id):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
