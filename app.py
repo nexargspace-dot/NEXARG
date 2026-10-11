@@ -239,6 +239,17 @@ def tienda_productos(tienda):
     conn.close()
     return jsonify([dict(row) for row in rows])
 
+@app.route('/api/<tienda>/productos/<product_id>', methods=['DELETE'])
+def eliminar_producto_tienda(tienda, product_id):
+    t = tienda_o_404(tienda)
+    conn = get_db()
+    cursor = conn.execute(f"DELETE FROM {t}_productos WHERE id=?", (product_id,))
+    conn.commit()
+    conn.close()
+    if cursor.rowcount == 0:
+        return jsonify({'error': 'Producto no encontrado.'}), 404
+    return jsonify({'ok': True})
+
 # ------------------------------------------------------------
 # PEDIDOS POR TIENDA:  /api/aurea/pedidos  /api/lumina/pedidos
 # ------------------------------------------------------------
