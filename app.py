@@ -1,20 +1,42 @@
-from flask import Flask, jsonify, request, send_from_directory, abort
+from flask import Flask, jsonify, send_from_directory, abort, request
 from flask_cors import CORS
-import sqlite3
-from datetime import datetime
+from werkzeug.middleware.proxy_fix import ProxyFix
+from datetime import datetime, timedelta
 import json
 import os
 import secrets
+import shutil
+import sqlite3
 
-app = Flask(__name__, static_folder='.', static_url_path='')
+import seguridad
+from seguridad import requiere_admin, limitar, texto, imagen_valida, hash_token
+
+# Solo API: no se sirve ninguna carpeta como estática (el frontend vive en Netlify/Cloudflare).
+app = Flask(__name__, static_folder=None)
+# Render pone la app detrás de un proxy: así request.remote_addr es la IP real del cliente.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1 MB por request
 CORS(app, resources={r"/api/*": {
     "origins": os.environ.get(
         'CORS_ORIGINS',
          'https://nexarg.space,https://www.nexarg.space,http://localhost:5000,http://127.0.0.1:5000,http://127.0.0.1:5500'
-    ).split(',')
+    ).split(','),
+    "allow_headers": ["Content-Type", "Authorization", "Accept"],
 }})
-DB = 'nmstudio.db'
-ORDERS_DIR = 'pedidos'
+seguridad.registrar(app)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+DB = os.path.join(DATA_DIR, 'nmstudio.db')
+ORDERS_DIR = os.path.join(DATA_DIR, 'pedidos')
+ASSETS_DIR = os.path.join(BASE_DIR, 'assets')
+IMAGENES_PERMITIDAS = {'.png', '.jpg', '.jpeg', '.webp', '.svg'}
+
+os.makedirs(DATA_DIR, exist_ok=True)
+# Migra la base vieja de la raíz del proyecto a data/ (una sola vez).
+_db_vieja = os.path.join(BASE_DIR, 'nmstudio.db')
+if os.path.exists(_db_vieja) and not os.path.exists(DB):
+    shutil.move(_db_vieja, DB)
 
 # ------------------------------------------------------------
 # TIENDAS: cada plantilla con carrito tiene sus propias tablas
@@ -117,8 +139,11 @@ def init_db():
             precio_unitario INTEGER NOT NULL
         );
         """)
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({t}_pedidos)").fetchall()}
+        if 'cancel_token_hash' not in cols:
+            conn.execute(f"ALTER TABLE {t}_pedidos ADD COLUMN cancel_token_hash TEXT")
 
-    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(pedidos)").fetchall()}
+    existing_columns ={row[1] for row in conn.execute("PRAGMA table_info(pedidos)").fetchall()}
     new_columns = {
         'plantilla_id': 'TEXT',
         'serie': 'TEXT',
@@ -156,25 +181,24 @@ def init_db():
 
 init_db()
 
-@app.route('/')
-def index():
-    return send_from_directory(app.static_folder, 'index.html')
-
 @app.route('/api/health')
 def health():
     return jsonify({'ok': True, 'service': 'nexarg-api'})
 
-@app.route('/admin')
-def admin():
-    return send_from_directory(app.static_folder, 'admin.html')
+@app.route('/assets/<path:nombre>')
+def servir_imagen(nombre):
+    # Solo imágenes y solo desde assets/ (send_from_directory ya impide salir con "../").
+    if os.path.splitext(nombre.lower())[1] not in IMAGENES_PERMITIDAS:
+        abort(404)
+    return send_from_directory(ASSETS_DIR, nombre)
 
 @app.route('/favicon-180x180.png')
 def favicon_180():
-    return send_from_directory('assets', 'Fondo Transparente (1).png')
+    return send_from_directory(ASSETS_DIR, 'Fondo Transparente (1).png')
 
 @app.route('/favicon-512x512.png')
 def favicon_512():
-    return send_from_directory('assets', 'Fondo Transparente (1).png')
+    return send_from_directory(ASSETS_DIR, 'Fondo Transparente (1).png')
 
 @app.route('/site.webmanifest')
 def site_manifest():
@@ -201,45 +225,53 @@ def get_plantillas():
 
 # ------------------------------------------------------------
 # PRODUCTOS POR TIENDA:  /api/aurea/productos  /api/lumina/productos
+# GET es público (lo usa la web). Modificar requiere sesión de admin.
 # ------------------------------------------------------------
-@app.route('/api/<tienda>/productos', methods=['GET', 'PUT'])
+@app.route('/api/<tienda>/productos', methods=['GET'])
 def tienda_productos(tienda):
     t = tienda_o_404(tienda)
-    tabla = f'{t}_productos'
     conn = get_db()
-    if request.method == 'PUT':
-        data = request.get_json(silent=True) or {}
-        incoming = data.get('productos') or []
-        if not isinstance(incoming, list):
-            conn.close()
-            return jsonify({'error': 'El formato de productos es inválido.'}), 400
-        try:
-            conn.execute('BEGIN IMMEDIATE')
-            for item in incoming:
-                product_id = str(item.get('id') or '').strip()
-                name = str(item.get('nombre') or '').strip()
-                price = int(item.get('precio') or 0)
-                stock = int(item.get('stock') or 0)
-                if not product_id or not name or price < 0 or stock < 0:
-                    raise ValueError('Producto, precio o stock inválido.')
-                conn.execute(
-                    f"INSERT INTO {tabla} (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?) "
-                    "ON CONFLICT(id) DO UPDATE SET nombre=excluded.nombre, precio=excluded.precio, stock=excluded.stock, "
-                    "imagen=excluded.imagen, descripcion=excluded.descripcion",
-                    (product_id, name, price, stock, str(item.get('imagen') or ''), str(item.get('descripcion') or ''))
-                )
-            conn.commit()
-        except (ValueError, TypeError) as error:
-            conn.rollback()
-            conn.close()
-            return jsonify({'error': str(error)}), 400
-        conn.close()
-        return jsonify({'ok': True})
-    rows = conn.execute(f"SELECT * FROM {tabla} ORDER BY id").fetchall()
+    rows = conn.execute(f"SELECT * FROM {t}_productos ORDER BY id").fetchall()
     conn.close()
     return jsonify([dict(row) for row in rows])
 
+@app.route('/api/<tienda>/productos', methods=['PUT', 'POST'])
+@requiere_admin
+def tienda_guardar_productos(tienda):
+    t = tienda_o_404(tienda)
+    tabla = f'{t}_productos'
+    data = request.get_json(silent=True) or {}
+    incoming = data.get('productos') or []
+    if not isinstance(incoming, list) or len(incoming) > 500:
+        return jsonify({'error': 'El formato de productos es inválido.'}), 400
+    conn = get_db()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        for item in incoming:
+            if not isinstance(item, dict):
+                raise ValueError('Producto inválido.')
+            product_id = texto(item.get('id'), 80)
+            name = texto(item.get('nombre'), 120)
+            price = int(item.get('precio') or 0)
+            stock = int(item.get('stock') or 0)
+            if not product_id or not name or not (0 <= price <= 100_000_000) or not (0 <= stock <= 1_000_000):
+                raise ValueError('Producto, precio o stock inválido.')
+            conn.execute(
+                f"INSERT INTO {tabla} (id, nombre, precio, stock, imagen, descripcion) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET nombre=excluded.nombre, precio=excluded.precio, stock=excluded.stock, "
+                "imagen=excluded.imagen, descripcion=excluded.descripcion",
+                (product_id, name, price, stock, imagen_valida(item.get('imagen')), texto(item.get('descripcion'), 1000))
+            )
+        conn.commit()
+    except (ValueError, TypeError) as error:
+        conn.rollback()
+        conn.close()
+        return jsonify({'error': str(error)}), 400
+    conn.close()
+    return jsonify({'ok': True})
+
 @app.route('/api/<tienda>/productos/<product_id>', methods=['DELETE'])
+@requiere_admin
 def eliminar_producto_tienda(tienda, product_id):
     t = tienda_o_404(tienda)
     conn = get_db()
@@ -252,47 +284,62 @@ def eliminar_producto_tienda(tienda, product_id):
 
 # ------------------------------------------------------------
 # PEDIDOS POR TIENDA:  /api/aurea/pedidos  /api/lumina/pedidos
+# Crear un pedido es público (lo hace el cliente). Verlos y cambiarles
+# el estado es solo para el admin.
 # ------------------------------------------------------------
-@app.route('/api/<tienda>/pedidos', methods=['GET', 'POST'])
-def tienda_pedidos(tienda):
+@app.route('/api/<tienda>/pedidos', methods=['GET'])
+@requiere_admin
+def tienda_listar_pedidos(tienda):
+    t = tienda_o_404(tienda)
+    conn = get_db()
+    orders = []
+    for row in conn.execute(f"SELECT * FROM {t}_pedidos ORDER BY creado DESC").fetchall():
+        order = dict(row)
+        order.pop('cancel_token_hash', None)
+        order['productos'] = [
+            dict(item) for item in conn.execute(
+                f"SELECT producto_id AS id, nombre, cantidad AS qty, precio_unitario AS precio "
+                f"FROM {t}_pedido_items WHERE pedido_id=?",
+                (row['id'],)
+            ).fetchall()
+        ]
+        orders.append(order)
+    conn.close()
+    return jsonify(orders)
+
+@app.route('/api/<tienda>/pedidos', methods=['POST'])
+@limitar(10, 600)
+def tienda_crear_pedido(tienda):
     t = tienda_o_404(tienda)
     t_productos = f'{t}_productos'
-    t_pedidos = f'{t}_pedidos'
-    t_items = f'{t}_pedido_items'
     prefijo = TIENDAS[t]['prefijo_pedido']
-    conn = get_db()
-    if request.method == 'GET':
-        orders = []
-        for row in conn.execute(f"SELECT * FROM {t_pedidos} ORDER BY creado DESC").fetchall():
-            order = dict(row)
-            order['productos'] = [
-                dict(item) for item in conn.execute(
-                    f"SELECT producto_id AS id, nombre, cantidad AS qty, precio_unitario AS precio "
-                    f"FROM {t_items} WHERE pedido_id=?",
-                    (row['id'],)
-                ).fetchall()
-            ]
-            orders.append(order)
-        conn.close()
-        return jsonify(orders)
-
     data = request.get_json(silent=True) or {}
     client = data.get('cliente') or {}
     items = data.get('productos') or []
-    name = str(client.get('nombre') or '').strip()
+    if not isinstance(client, dict) or not isinstance(items, list):
+        return jsonify({'error': 'Formato de pedido inválido.'}), 400
+    name = texto(client.get('nombre'), 120)
     if not name or not items:
-        conn.close()
         return jsonify({'error': 'El nombre y al menos un producto son obligatorios.'}), 400
+    if len(items) > 50:
+        return jsonify({'error': 'Demasiados productos en un solo pedido.'}), 400
 
+    conn = get_db()
     try:
         conn.execute('BEGIN IMMEDIATE')
+        # Agrupa por id: así no se puede esquivar el control de stock repitiendo el mismo producto.
+        cantidades = {}
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError('Producto inválido.')
+            product_id = texto(item.get('id'), 80)
+            quantity = int(item.get('qty') or 0)
+            if not product_id or not (1 <= quantity <= 100):
+                raise ValueError('Producto o cantidad inválida.')
+            cantidades[product_id] = cantidades.get(product_id, 0) + quantity
         normalized = []
         total = 0
-        for item in items:
-            product_id = str(item.get('id') or '').strip()
-            quantity = int(item.get('qty') or 0)
-            if not product_id or quantity <= 0:
-                raise ValueError('Producto o cantidad inválida.')
+        for product_id, quantity in cantidades.items():
             product = conn.execute(f"SELECT * FROM {t_productos} WHERE id=?", (product_id,)).fetchone()
             if not product:
                 raise ValueError('Producto no encontrado.')
@@ -303,23 +350,25 @@ def tienda_pedidos(tienda):
             normalized.append((product, quantity))
             total += product['precio'] * quantity
 
-        order_id = f"{prefijo}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(2).upper()}"
+        order_id = f"{prefijo}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4).upper()}"
+        cancel_token = secrets.token_urlsafe(24)
         now = datetime.now().isoformat()
         conn.execute(
-            f"INSERT INTO {t_pedidos} (id, cliente_nombre, cliente_gmail, cliente_telefono, total, estado, creado, historial) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (order_id, name, str(client.get('gmail') or '').strip(), str(client.get('telefono') or '').strip(),
-             total, 'NUEVO', now, 'NUEVO')
+            f"INSERT INTO {t}_pedidos (id, cliente_nombre, cliente_gmail, cliente_telefono, total, estado, creado, historial, cancel_token_hash) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (order_id, name, texto(client.get('gmail'), 160), texto(client.get('telefono'), 40),
+             total, 'NUEVO', now, 'NUEVO', hash_token(cancel_token))
         )
         for product, quantity in normalized:
             conn.execute(
-                f"INSERT INTO {t_items} (pedido_id, producto_id, nombre, cantidad, precio_unitario) VALUES (?,?,?,?,?)",
+                f"INSERT INTO {t}_pedido_items (pedido_id, producto_id, nombre, cantidad, precio_unitario) VALUES (?,?,?,?,?)",
                 (order_id, product['id'], product['nombre'], quantity, product['precio'])
             )
             conn.execute(f"UPDATE {t_productos} SET stock=stock-? WHERE id=?", (quantity, product['id']))
         conn.commit()
         conn.close()
-        return jsonify({'id': order_id, 'total': total, 'estado': 'NUEVO'}), 201
+        # cancelToken: solo lo recibe quien creó el pedido, para poder anularlo si falla el turno.
+        return jsonify({'id': order_id, 'total': total, 'estado': 'NUEVO', 'cancelToken': cancel_token}), 201
     except (ValueError, TypeError) as error:
         conn.rollback()
         conn.close()
@@ -329,117 +378,158 @@ def tienda_pedidos(tienda):
         conn.close()
         raise
 
-@app.route('/api/<tienda>/pedidos/<order_id>/estado', methods=['PUT'])
-def tienda_cambiar_estado(tienda, order_id):
-    t = tienda_o_404(tienda)
-    t_productos = f'{t}_productos'
-    t_pedidos = f'{t}_pedidos'
-    t_items = f'{t}_pedido_items'
-    data = request.get_json(silent=True) or {}
-    new_status = str(data.get('estado') or '').strip().upper()
+def _cambiar_estado_tienda(t, order_id, new_status, cancel_token=None):
     allowed = {'NUEVO', 'CONFIRMADO', 'ENTREGADO', 'CANCELADO'}
     if new_status not in allowed:
         return jsonify({'error': 'Estado inválido.'}), 400
     conn = get_db()
     conn.execute('BEGIN IMMEDIATE')
-    row = conn.execute(f"SELECT estado, historial FROM {t_pedidos} WHERE id=?", (order_id,)).fetchone()
+    row = conn.execute(f"SELECT estado, historial, creado, cancel_token_hash FROM {t}_pedidos WHERE id=?", (order_id,)).fetchone()
     if not row:
         conn.rollback()
         conn.close()
         return jsonify({'error': 'Pedido no encontrado.'}), 404
+    if cancel_token is not None:
+        # Cancelación hecha por el propio cliente: token correcto, pedido nuevo y de hace menos de 30 min.
+        valido = (
+            row['cancel_token_hash']
+            and secrets.compare_digest(row['cancel_token_hash'], hash_token(cancel_token))
+            and row['estado'] == 'NUEVO'
+            and datetime.fromisoformat(row['creado']) > datetime.now() - timedelta(minutes=30)
+        )
+        if not valido:
+            conn.rollback()
+            conn.close()
+            return jsonify({'error': 'No se puede cancelar este pedido. Contactá al negocio.'}), 403
     if row['estado'] == 'CANCELADO' and new_status != 'CANCELADO':
         conn.rollback()
         conn.close()
         return jsonify({'error': 'Un pedido cancelado no puede reabrirse.'}), 409
     if new_status == 'CANCELADO' and row['estado'] != 'CANCELADO':
-        for item in conn.execute(f"SELECT producto_id, cantidad FROM {t_items} WHERE pedido_id=?", (order_id,)).fetchall():
-            conn.execute(f"UPDATE {t_productos} SET stock=stock+? WHERE id=?", (item['cantidad'], item['producto_id']))
+        for item in conn.execute(f"SELECT producto_id, cantidad FROM {t}_pedido_items WHERE pedido_id=?", (order_id,)).fetchall():
+            conn.execute(f"UPDATE {t}_productos SET stock=stock+? WHERE id=?", (item['cantidad'], item['producto_id']))
     history = f"{row['historial']} -> {new_status}"
-    conn.execute(f"UPDATE {t_pedidos} SET estado=?, historial=? WHERE id=?", (new_status, history, order_id))
+    conn.execute(f"UPDATE {t}_pedidos SET estado=?, historial=? WHERE id=?", (new_status, history, order_id))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
 
-@app.route('/api/pedidos', methods=['GET','POST'])
-def pedidos():
-    conn = get_db()
-    if request.method == 'POST':
-        data = request.get_json(silent=True) or {}
-        client = data.get('cliente') or {}
-        customization = data.get('customization') or {}
-        name = str(client.get('nombre') or client.get('name') or '').strip()
-        email = str(client.get('email') or '').strip()
-        whatsapp = str(client.get('whatsapp') or '').strip()
-        if not name or not email or not whatsapp:
-            conn.close()
-            return jsonify({'error': 'Nombre, email y WhatsApp son obligatorios.'}), 400
+@app.route('/api/<tienda>/pedidos/<order_id>/estado', methods=['PUT'])
+@requiere_admin
+def tienda_cambiar_estado(tienda, order_id):
+    t = tienda_o_404(tienda)
+    data = request.get_json(silent=True) or {}
+    return _cambiar_estado_tienda(t, order_id, texto(data.get('estado'), 20).upper())
 
-        now = datetime.now()
-        serial = f"NEX-{now.strftime('%Y%m%d')}-{secrets.token_hex(3).upper()}"
-        pedido_id = serial
-        template_id = str(data.get('template') or 'peluqueria-aurea')
-        total = int(data.get('total') or 0)
-        delivery_email = str(data.get('gmailEntrega') or client.get('gmail') or email).strip()
-        publication_mode = str(data.get('modalidadPublicacion') or 'carpeta-descargable').strip()
-        domain = str(data.get('dominio') or '').strip()
-        notes = str(data.get('observaciones') or '').strip()
-        customization_json = json.dumps(customization, ensure_ascii=False)
-        columns = ('id, cliente_nombre, cliente_whatsapp, cliente_email, total, estado, fecha, historial, '
-                   'plantilla_id, serie, personalizacion_json, gmail_entrega, modalidad_publicacion, dominio, '
-                   'observaciones, estado_pago')
-        values = (pedido_id, name, whatsapp, email, total, 'RECIBIDO', now.isoformat(), 'RECIBIDO',
-                  template_id, serial, customization_json, delivery_email, publication_mode, domain, notes,
-                  'PENDIENTE')
-        conn.execute(f"INSERT INTO pedidos ({columns}) VALUES ({','.join(['?'] * len(values))})", values)
-        for item in data.get('items', []):
-            conn.execute("INSERT INTO pedido_items VALUES (?,?,?,?)",
-                         (pedido_id, item.get('id'), item.get('nombre'), item.get('precio', 0)))
-        conn.commit()
+@app.route('/api/<tienda>/pedidos/<order_id>/cancelar', methods=['POST'])
+@limitar(10, 600)
+def tienda_cancelar_pedido_cliente(tienda, order_id):
+    t = tienda_o_404(tienda)
+    data = request.get_json(silent=True) or {}
+    token = texto(data.get('cancelToken'), 100)
+    if not token:
+        return jsonify({'error': 'Falta el código de cancelación.'}), 400
+    return _cambiar_estado_tienda(t, order_id, 'CANCELADO', cancel_token=token)
+
+# ------------------------------------------------------------
+# PEDIDOS DE WEBS NEX ARG
+# ------------------------------------------------------------
+@app.route('/api/pedidos', methods=['GET'])
+@requiere_admin
+def listar_pedidos():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM pedidos ORDER BY fecha DESC").fetchall()
+    result = []
+    for r in rows:
+        items = conn.execute("SELECT * FROM pedido_items WHERE pedido_id=?", (r['id'],)).fetchall()
+        d = dict(r)
+        d['items'] = [dict(i) for i in items]
+        if d.get('personalizacion_json'):
+            try:
+                d['customization'] = json.loads(d['personalizacion_json'])
+            except json.JSONDecodeError:
+                d['customization'] = {}
+        result.append(d)
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/pedidos', methods=['POST'])
+@limitar(5, 600)
+def crear_pedido():
+    data = request.get_json(silent=True) or {}
+    client = data.get('cliente') or {}
+    customization = data.get('customization') or {}
+    if not isinstance(client, dict) or not isinstance(customization, dict):
+        return jsonify({'error': 'Formato de pedido inválido.'}), 400
+    name = texto(client.get('nombre') or client.get('name'), 120)
+    email = texto(client.get('email'), 160)
+    whatsapp = texto(client.get('whatsapp'), 40)
+    if not name or not email or not whatsapp or '@' not in email:
+        return jsonify({'error': 'Nombre, email y WhatsApp son obligatorios.'}), 400
+
+    conn = get_db()
+    template_id = texto(data.get('template') or 'peluqueria-aurea', 80)
+    plantilla = conn.execute("SELECT id, nombre, precio_num FROM plantillas WHERE id=?", (template_id,)).fetchone()
+    if not plantilla:
         conn.close()
-        os.makedirs(os.path.join(ORDERS_DIR, serial), exist_ok=True)
-        order_copy = {
-            'id': pedido_id,
-            'serie': serial,
-            'template': template_id,
-            'client': {'name': name, 'email': email, 'whatsapp': whatsapp},
-            'gmailEntrega': delivery_email,
-            'modalidadPublicacion': publication_mode,
-            'dominio': domain,
-            'observaciones': notes,
-            'customization': customization,
-            'createdAt': now.isoformat(),
-            'paymentStatus': 'pending'
-        }
-        with open(os.path.join(ORDERS_DIR, serial, 'pedido.json'), 'w', encoding='utf-8') as file:
-            json.dump(order_copy, file, ensure_ascii=False, indent=2)
-        return jsonify({"id": pedido_id, "serie": serial, "status": "ok", "paymentStatus": "pending"})
-    else:
-        rows = conn.execute("SELECT * FROM pedidos ORDER BY fecha DESC").fetchall()
-        result = []
-        for r in rows:
-            items = conn.execute("SELECT * FROM pedido_items WHERE pedido_id=?", (r['id'],)).fetchall()
-            d = dict(r)
-            d['items'] = [dict(i) for i in items]
-            if d.get('personalizacion_json'):
-                try:
-                    d['customization'] = json.loads(d['personalizacion_json'])
-                except json.JSONDecodeError:
-                    d['customization'] = {}
-            result.append(d)
-        conn.close()
-        return jsonify(result)
+        return jsonify({'error': 'Plantilla inexistente.'}), 400
+    # El precio sale SIEMPRE de la base, nunca de lo que manda el navegador.
+    total = int(plantilla['precio_num'] or 0)
+
+    now = datetime.now()
+    serial = f"NEX-{now.strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}"
+    pedido_id = serial
+    delivery_email = texto(data.get('gmailEntrega') or client.get('gmail') or email, 160)
+    publication_mode = texto(data.get('modalidadPublicacion') or 'carpeta-descargable', 40)
+    domain = texto(data.get('dominio'), 120)
+    notes = texto(data.get('observaciones'), 2000)
+    customization_json = json.dumps(customization, ensure_ascii=False)
+    columns = ('id, cliente_nombre, cliente_whatsapp, cliente_email, total, estado, fecha, historial, '
+               'plantilla_id, serie, personalizacion_json, gmail_entrega, modalidad_publicacion, dominio, '
+               'observaciones, estado_pago')
+    values = (pedido_id, name, whatsapp, email, total, 'RECIBIDO', now.isoformat(), 'RECIBIDO',
+              template_id, serial, customization_json, delivery_email, publication_mode, domain, notes,
+              'PENDIENTE')
+    conn.execute(f"INSERT INTO pedidos ({columns}) VALUES ({','.join(['?'] * len(values))})", values)
+    conn.execute("INSERT INTO pedido_items VALUES (?,?,?,?)",
+                 (pedido_id, plantilla['id'], plantilla['nombre'], total))
+    conn.commit()
+    conn.close()
+    os.makedirs(os.path.join(ORDERS_DIR, serial), exist_ok=True)
+    order_copy = {
+        'id': pedido_id,
+        'serie': serial,
+        'template': template_id,
+        'client': {'name': name, 'email': email, 'whatsapp': whatsapp},
+        'gmailEntrega': delivery_email,
+        'modalidadPublicacion': publication_mode,
+        'dominio': domain,
+        'observaciones': notes,
+        'customization': customization,
+        'createdAt': now.isoformat(),
+        'paymentStatus': 'pending'
+    }
+    with open(os.path.join(ORDERS_DIR, serial, 'pedido.json'), 'w', encoding='utf-8') as file:
+        json.dump(order_copy, file, ensure_ascii=False, indent=2)
+    return jsonify({"id": pedido_id, "serie": serial, "status": "ok", "paymentStatus": "pending"})
 
 @app.route('/api/pedidos/<id>/estado', methods=['PUT'])
+@requiere_admin
 def cambiar_estado(id):
-    nuevo = request.json['estado']
+    data = request.get_json(silent=True) or {}
+    nuevo = texto(data.get('estado'), 30).upper()
+    if nuevo not in {'RECIBIDO', 'EN_PREPARACION', 'ENTREGADO', 'CANCELADO', 'PAGADO'}:
+        return jsonify({'error': 'Estado inválido.'}), 400
     conn = get_db()
     row = conn.execute("SELECT historial FROM pedidos WHERE id=?", (id,)).fetchone()
-    hist = row['historial'] + f" -> {nuevo}" if row else nuevo
-    conn.execute("UPDATE pedidos SET estado=?, historial=? WHERE id=?", (nuevo, hist, id))
+    if not row:
+        conn.close()
+        return jsonify({'error': 'Pedido no encontrado.'}), 404
+    conn.execute("UPDATE pedidos SET estado=?, historial=? WHERE id=?", (nuevo, f"{row['historial']} -> {nuevo}", id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
