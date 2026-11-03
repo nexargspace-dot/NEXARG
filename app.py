@@ -8,6 +8,8 @@ import secrets
 import shutil
 import sqlite3
 
+import requests  # NEXARG AI: para enviar mensajes a WhatsApp
+
 import seguridad
 from seguridad import requiere_admin, limitar, texto, imagen_valida, hash_token
 
@@ -529,6 +531,75 @@ def cambiar_estado(id):
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
+
+# ------------------------------------------------------------
+# NEXARG AI - WEBHOOK DE WHATSAPP (Fase 2: modo eco)
+# Por ahora la IA solo repite lo que recibe, para probar que todo conecta.
+# En la Fase 3 reemplazamos la respuesta eco por el cerebro (Claude).
+#
+# Variables de entorno en Render (Environment):
+#   WHATSAPP_TOKEN   -> token de acceso de Meta (nunca en el código ni en GitHub)
+#   PHONE_NUMBER_ID  -> "Phone Number ID" del número de prueba
+#   VERIFY_TOKEN     -> palabra secreta que inventás vos (ej: nexarg-verifica-2026)
+# ------------------------------------------------------------
+GRAPH_URL = "https://graph.facebook.com/v25.0"
+
+def normalizar_numero_ar(numero):
+    # Meta entrega los celulares argentinos como 549XXXXXXXXXX, pero el número
+    # de prueba los guarda como 54XXXXXXXXXX (sin el 9). Esto lo corrige.
+    if numero.startswith("549") and len(numero) == 13:
+        return "54" + numero[3:]
+    return numero
+
+def enviar_whatsapp(destino, mensaje):
+    token = os.environ["WHATSAPP_TOKEN"]
+    phone_id = os.environ["PHONE_NUMBER_ID"]
+    respuesta = requests.post(
+        f"{GRAPH_URL}/{phone_id}/messages",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "messaging_product": "whatsapp",
+            "to": normalizar_numero_ar(destino),
+            "type": "text",
+            "text": {"body": mensaje},
+        },
+        timeout=15,
+    )
+    if respuesta.status_code >= 400:
+        print("Error al enviar a WhatsApp:", respuesta.status_code, respuesta.text)
+    return respuesta
+
+@app.route('/webhook', methods=['GET'])
+def verificar_webhook():
+    # Meta llama a esta ruta UNA vez para comprobar que el servidor es tuyo.
+    modo = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    desafio = request.args.get("hub.challenge")
+    if modo == "subscribe" and token and token == os.environ.get("VERIFY_TOKEN"):
+        return desafio, 200
+    return "Token de verificación incorrecto", 403
+
+@app.route('/webhook', methods=['POST'])
+def recibir_whatsapp():
+    # Meta llama a esta ruta cada vez que alguien le escribe al número.
+    datos = request.get_json(silent=True) or {}
+    try:
+        for entrada in datos.get("entry", []):
+            for cambio in entrada.get("changes", []):
+                valor = cambio.get("value", {})
+                for mensaje in valor.get("messages", []):
+                    remitente = mensaje.get("from")
+                    if mensaje.get("type") == "text":
+                        recibido = mensaje["text"]["body"]
+                        print(f"Mensaje de {remitente}: {recibido}")
+                        # FASE 2: modo eco. En la Fase 3 acá entra el cerebro.
+                        enviar_whatsapp(remitente, f"¡Hola! Soy NEXARG AI 🤖 Recibí: {recibido}")
+                    else:
+                        enviar_whatsapp(remitente, "Por ahora solo entiendo mensajes de texto 😊")
+    except Exception as error:
+        # Nunca devolvemos error a Meta: si no, reintenta el mismo mensaje muchas veces.
+        print("Error procesando el webhook:", error)
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
