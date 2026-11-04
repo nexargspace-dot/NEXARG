@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, send_from_directory, abort, request
+ from flask import Flask, jsonify, send_from_directory, abort, request
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, timedelta
@@ -8,7 +8,11 @@ import secrets
 import shutil
 import sqlite3
 
-import requests  # NEXARG AI: para enviar mensajes a WhatsApp
+import threading
+import time
+from collections import deque, OrderedDict
+
+import requests  # NEXARG AI: para hablar con WhatsApp y con Claude
 
 import seguridad
 from seguridad import requiere_admin, limitar, texto, imagen_valida, hash_token
@@ -533,16 +537,32 @@ def cambiar_estado(id):
     return jsonify({"ok": True})
 
 # ------------------------------------------------------------
-# NEXARG AI - WEBHOOK DE WHATSAPP (Fase 2: modo eco)
-# Por ahora la IA solo repite lo que recibe, para probar que todo conecta.
-# En la Fase 3 reemplazamos la respuesta eco por el cerebro (Claude).
+# NEXARG AI - FASE 3: EL CEREBRO
+# WhatsApp -> este servidor -> Claude (con la instrucción maestra) -> WhatsApp
 #
 # Variables de entorno en Render (Environment):
-#   WHATSAPP_TOKEN   -> token de acceso de Meta (nunca en el código ni en GitHub)
-#   PHONE_NUMBER_ID  -> "Phone Number ID" del número de prueba
-#   VERIFY_TOKEN     -> palabra secreta que inventás vos (ej: nexarg-verifica-2026)
+#   WHATSAPP_TOKEN     -> token permanente de Meta
+#   PHONE_NUMBER_ID    -> "Phone Number ID" del número
+#   VERIFY_TOKEN       -> palabra secreta del webhook (nexarg-verifica-2026)
+#   ANTHROPIC_API_KEY  -> clave de la API de Claude (console.anthropic.com)
+#   DUENO_WHATSAPP     -> número del dueño para avisos, sin + ni espacios (ej: 541151323616)
+#   AGENTE_NOMBRE      -> (opcional) nombre de la vendedora. Por defecto: Luz
+#   CLAUDE_MODEL       -> (opcional) modelo. Por defecto: claude-haiku-5-5
 # ------------------------------------------------------------
 GRAPH_URL = "https://graph.facebook.com/v25.0"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+# Memoria de conversaciones (en RAM). OJO: se borra si Render reinicia.
+# En la Fase 4 la pasamos a Supabase para que sea permanente.
+HISTORIAL_MAX = 20                      # últimos mensajes que recuerda por cliente
+_historiales = {}                       # numero -> deque de {"role","content"}
+_pausados = {}                          # numero -> timestamp hasta cuándo la IA no responde
+_vistos = OrderedDict()                 # ids de mensajes ya procesados (Meta a veces reenvía)
+_candados = {}                          # numero -> Lock, para no contestar dos veces a la vez
+_lock_global = threading.Lock()
+
+PAUSA_DERIVACION_SEG = 2 * 60 * 60      # si deriva al dueño, la IA se calla 2 horas en ese chat
+
 
 def normalizar_numero_ar(numero):
     # Meta entrega los celulares argentinos como 549XXXXXXXXXX, pero el número
@@ -551,23 +571,196 @@ def normalizar_numero_ar(numero):
         return "54" + numero[3:]
     return numero
 
+
+def _headers_meta():
+    return {"Authorization": f"Bearer {os.environ['WHATSAPP_TOKEN']}",
+            "Content-Type": "application/json"}
+
+
 def enviar_whatsapp(destino, mensaje):
-    token = os.environ["WHATSAPP_TOKEN"]
-    phone_id = os.environ["PHONE_NUMBER_ID"]
     respuesta = requests.post(
-        f"{GRAPH_URL}/{phone_id}/messages",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={
-            "messaging_product": "whatsapp",
-            "to": normalizar_numero_ar(destino),
-            "type": "text",
-            "text": {"body": mensaje},
-        },
+        f"{GRAPH_URL}/{os.environ['PHONE_NUMBER_ID']}/messages",
+        headers=_headers_meta(),
+        json={"messaging_product": "whatsapp", "to": normalizar_numero_ar(destino),
+              "type": "text", "text": {"body": mensaje}},
         timeout=15,
     )
     if respuesta.status_code >= 400:
         print("Error al enviar a WhatsApp:", respuesta.status_code, respuesta.text)
     return respuesta
+
+
+def marcar_leido_y_escribiendo(message_id):
+    # Tildes azules + "escribiendo..." mientras la IA piensa. Si falla, no pasa nada.
+    try:
+        requests.post(
+            f"{GRAPH_URL}/{os.environ['PHONE_NUMBER_ID']}/messages",
+            headers=_headers_meta(),
+            json={"messaging_product": "whatsapp", "status": "read",
+                  "message_id": message_id, "typing_indicator": {"type": "text"}},
+            timeout=10,
+        )
+    except Exception as error:
+        print("No se pudo marcar como leído:", error)
+
+
+# ------------------------------------------------------------
+# DATOS DEL NEGOCIO (capa 3). Por ahora: NEX ARG.
+# Más adelante cada negocio carga esto desde su panel.
+# ------------------------------------------------------------
+def datos_del_negocio():
+    try:
+        conn = get_db()
+        # Solo las webs terminadas. Cuando sumes una nueva, agregá su id acá.
+        disponibles = ('peluqueria-aurea', 'peluqueria-lumina')
+        filas = conn.execute(
+            f"SELECT nombre, precio, desc_text FROM plantillas WHERE id IN ({','.join('?' * len(disponibles))})",
+            disponibles).fetchall()
+        conn.close()
+        catalogo = "\n".join(f"- {f['nombre']}: {f['precio']} — {f['desc_text']}" for f in filas)
+        catalogo += ("\n- Lira (peluquería): PRÓXIMAMENTE, todavía sin precio. Si preguntan, decí que sale muy pronto "
+                     "y ofrecé avisarle cuando esté.\n"
+                     "Por ahora solo hay webs para peluquerías y salones de belleza. Otros rubros vienen pronto: "
+                     "si el cliente tiene otro rubro, contale que se están sumando y usá [DERIVAR: interesado en rubro X].")
+    except Exception as error:
+        print("No se pudo leer el catálogo:", error)
+        catalogo = "(catálogo no disponible ahora)"
+    return f"""NEGOCIO: NEX ARG — webs premium por rubro para negocios y PYMEs (Quilmes, Buenos Aires, Argentina).
+Web: https://nexarg.space (ahí está el catálogo completo y se compra online).
+
+CATÁLOGO (precios finales, no inventes otros):
+{catalogo}
+
+POLÍTICAS:
+- Entrega: 48 horas hábiles después de confirmado el pago.
+- El cliente completa un formulario con sus datos y fotos, y la web se arma tal cual lo envió.
+- Cambios post-entrega: solo errores de carga (foto, texto o teléfono mal) avisados dentro de las 2 horas hábiles de enviado el formulario.
+- Hosting: queda en la cuenta del propio cliente.
+- Dominio propio: se vende aparte e incluye 1 año gratis.
+- Cuotas: con la tarjeta o el banco del cliente (no financia NEX ARG).
+- Mantenimiento mensual opcional para cambios chicos (fotos, precios, textos), no rediseños.
+- Garantía: 100% ante errores reales del sitio, con arreglo gratis o devolución.
+- Extra opcional: sistema de pedidos/turnos con panel para el dueño y pagos con Mercado Pago.
+
+CÓMO SE COMPRA: entrando a https://nexarg.space, eligiendo la plantilla y tocando "Obtener esta web"."""
+
+
+def instruccion_maestra():
+    nombre = os.environ.get("AGENTE_NOMBRE", "Luz")
+    return f"""Sos {nombre}, la vendedora de NEX ARG que atiende el WhatsApp del negocio. Tu trabajo es ayudar y vender, como la mejor vendedora del local.
+
+CÓMO ESCRIBÍS (capa humana):
+- Escribís como una persona real por WhatsApp: mensajes cortos, naturales, cálidos.
+- Si la respuesta tiene más de una idea, separala en 2 o 3 mensajes cortos usando ||| entre cada uno. Nunca más de 3.
+- Una sola pregunta por vez.
+- Copiás el estilo del cliente: si escribe corto y sin emojis, vos igual; si usa emojis, podés usar uno o dos.
+- Usás voseo rioplatense ("querés", "tenés") si el cliente escribe en español de Argentina. Si escribe en otro idioma o variante, respondé en ese idioma y con su forma de hablar.
+- Nada de palabras de catálogo ("exclusivo", "calce premium", "de forma impecable", "estimado cliente"). Hablás como una persona, no como un folleto.
+- Sin listas largas ni formato raro: es WhatsApp, no un mail.
+- Si es el primer mensaje, saludás corto y preguntás en qué lo podés ayudar o qué tipo de negocio tiene.
+
+CÓMO VENDÉS (capa de ventas):
+- Primero entendés qué necesita: qué negocio tiene, qué quiere lograr.
+- Recomendás la opción que mejor le sirve, con un beneficio concreto para su negocio, no una lista de características.
+- Ofrecés el complemento (dominio propio, sistema de turnos/pedidos, mantenimiento) recién DESPUÉS de que muestre interés en algo. Como consejo, nunca como presión.
+- Si duda por el precio, mostrás el valor (vende 24/7, se ve profesional, entrega en 48 hs) y mencionás las cuotas.
+- Cuando está listo, le pasás el link para comprar y le decís el siguiente paso.
+
+REGLAS DE ORO:
+- NUNCA inventes precios, plazos, productos, descuentos ni datos que no estén en la información del negocio.
+- Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
+- Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NEX ARG y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
+- No hables de temas que no tengan que ver con el negocio; volvé amablemente a lo que el cliente necesita.
+
+INFORMACIÓN DEL NEGOCIO:
+{datos_del_negocio()}"""
+
+
+def preguntar_a_claude(historial):
+    respuesta = requests.post(
+        ANTHROPIC_URL,
+        headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"),
+              "max_tokens": 2000,
+              "system": instruccion_maestra(),
+              "messages": list(historial)},
+        timeout=60,
+    )
+    if respuesta.status_code >= 400:
+        print("Error de Claude:", respuesta.status_code, respuesta.text)
+        return None
+    datos = respuesta.json()
+    # Solo nos quedamos con el texto (si el modelo "piensa", esos bloques se ignoran).
+    return "".join(b.get("text", "") for b in datos.get("content", []) if b.get("type") == "text").strip()
+
+
+def avisar_al_dueno(cliente, motivo, ultimo_mensaje):
+    dueno = os.environ.get("DUENO_WHATSAPP")
+    if not dueno:
+        print("DERIVACIÓN sin DUENO_WHATSAPP configurado:", cliente, motivo)
+        return
+    enviar_whatsapp(dueno, f"🔔 NEXARG AI necesita que atiendas este chat\n"
+                           f"Cliente: +{cliente}\nMotivo: {motivo}\n"
+                           f"Último mensaje: \"{ultimo_mensaje[:300]}\"\n\n"
+                           f"La IA queda en pausa 2 horas en ese chat.")
+
+
+def responder_con_ia(remitente, recibido, message_id):
+    with _lock_global:
+        candado = _candados.setdefault(remitente, threading.Lock())
+    with candado:
+        try:
+            # Comando de prueba: "/reset" borra la memoria y saca la pausa.
+            if recibido.strip().lower() == "/reset":
+                _historiales.pop(remitente, None)
+                _pausados.pop(remitente, None)
+                enviar_whatsapp(remitente, "🔄 Memoria borrada. Empecemos de nuevo.")
+                return
+
+            if _pausados.get(remitente, 0) > time.time():
+                print(f"Chat {remitente} en pausa (lo atiende el dueño).")
+                return
+
+            marcar_leido_y_escribiendo(message_id)
+            historial = _historiales.setdefault(remitente, deque(maxlen=HISTORIAL_MAX))
+            historial.append({"role": "user", "content": recibido[:2000]})
+            # La conversación tiene que empezar con un mensaje del cliente.
+            while historial and historial[0]["role"] != "user":
+                historial.popleft()
+
+            texto_ia = preguntar_a_claude(historial)
+            if not texto_ia:
+                historial.pop()
+                enviar_whatsapp(remitente, "Perdón, se me cortó algo 😅 ¿Me lo repetís en un ratito?")
+                return
+
+            # ¿Pidió derivar al dueño?
+            motivo = None
+            if "[DERIVAR" in texto_ia:
+                inicio = texto_ia.index("[DERIVAR")
+                fin = texto_ia.find("]", inicio)
+                etiqueta = texto_ia[inicio:fin + 1] if fin != -1 else texto_ia[inicio:]
+                motivo = etiqueta.strip("[]").replace("DERIVAR", "").strip(" :") or "sin detalle"
+                texto_ia = texto_ia.replace(etiqueta, "").strip()
+
+            historial.append({"role": "assistant", "content": texto_ia})
+
+            # Toque humano: varios mensajes cortos, con una pausa según el largo.
+            partes = [p.strip() for p in texto_ia.split("|||") if p.strip()][:3]
+            for i, parte in enumerate(partes):
+                if i > 0:
+                    marcar_leido_y_escribiendo(message_id)
+                    time.sleep(min(1.5 + len(parte) / 40, 6))
+                enviar_whatsapp(remitente, parte)
+
+            if motivo:
+                _pausados[remitente] = time.time() + PAUSA_DERIVACION_SEG
+                avisar_al_dueno(remitente, motivo, recibido)
+        except Exception as error:
+            print("Error en responder_con_ia:", error)
+
 
 @app.route('/webhook', methods=['GET'])
 def verificar_webhook():
@@ -579,23 +772,32 @@ def verificar_webhook():
         return desafio, 200
     return "Token de verificación incorrecto", 403
 
+
 @app.route('/webhook', methods=['POST'])
 def recibir_whatsapp():
     # Meta llama a esta ruta cada vez que alguien le escribe al número.
+    # Respondemos 200 al toque y la IA trabaja en segundo plano (si no, Meta reintenta).
     datos = request.get_json(silent=True) or {}
     try:
         for entrada in datos.get("entry", []):
             for cambio in entrada.get("changes", []):
                 valor = cambio.get("value", {})
                 for mensaje in valor.get("messages", []):
+                    mid = mensaje.get("id")
+                    with _lock_global:
+                        if mid in _vistos:
+                            continue
+                        _vistos[mid] = True
+                        while len(_vistos) > 1000:
+                            _vistos.popitem(last=False)
                     remitente = mensaje.get("from")
                     if mensaje.get("type") == "text":
                         recibido = mensaje["text"]["body"]
                         print(f"Mensaje de {remitente}: {recibido}")
-                        # FASE 2: modo eco. En la Fase 3 acá entra el cerebro.
-                        enviar_whatsapp(remitente, f"¡Hola! Soy NEXARG AI 🤖 Recibí: {recibido}")
+                        threading.Thread(target=responder_con_ia,
+                                         args=(remitente, recibido, mid), daemon=True).start()
                     else:
-                        enviar_whatsapp(remitente, "Por ahora solo entiendo mensajes de texto 😊")
+                        enviar_whatsapp(remitente, "Por ahora leo solo mensajes de texto 😊 ¿Me lo escribís?")
     except Exception as error:
         # Nunca devolvemos error a Meta: si no, reintenta el mismo mensaje muchas veces.
         print("Error procesando el webhook:", error)
