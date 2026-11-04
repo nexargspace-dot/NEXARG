@@ -16,6 +16,7 @@ import requests  # NEXARG AI: para hablar con WhatsApp y con Claude
 
 import seguridad
 from seguridad import requiere_admin, limitar, texto, imagen_valida, hash_token
+import memoria  # NEXARG AI: memoria permanente de conversaciones en Supabase
 
 # Solo API: no se sirve ninguna carpeta como estática (el frontend vive en Netlify/Cloudflare).
 app = Flask(__name__, static_folder=None)
@@ -548,14 +549,16 @@ def cambiar_estado(id):
 #   DUENO_WHATSAPP     -> número del dueño para avisos, sin + ni espacios (ej: 541151323616)
 #   AGENTE_NOMBRE      -> (opcional) nombre de la vendedora. Por defecto: Luz
 #   CLAUDE_MODEL       -> (opcional) modelo. Por defecto: claude-haiku-5-5
+#   SUPABASE_URL          -> URL del proyecto Supabase "NEXARG AI"
+#   SUPABASE_SERVICE_KEY  -> secret key (sb_secret_...) o service_role. Solo acá, nunca en GitHub.
 # ------------------------------------------------------------
 GRAPH_URL = "https://graph.facebook.com/v25.0"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
-# Memoria de conversaciones (en RAM). OJO: se borra si Render reinicia.
-# En la Fase 4 la pasamos a Supabase para que sea permanente.
+# FASE 4: la memoria de conversaciones vive en Supabase (memoria.py) y no se borra.
+# La memoria en RAM queda solo como respaldo si Supabase no responde.
 HISTORIAL_MAX = 20                      # últimos mensajes que recuerda por cliente
-_historiales = {}                       # numero -> deque de {"role","content"}
+_historiales = {}                       # respaldo: numero -> deque de {"role","content"}
 _pausados = {}                          # numero -> timestamp hasta cuándo la IA no responde
 _vistos = OrderedDict()                 # ids de mensajes ya procesados (Meta a veces reenvía)
 _candados = {}                          # numero -> Lock, para no contestar dos veces a la vez
@@ -645,8 +648,8 @@ POLÍTICAS:
 CÓMO SE COMPRA: entrando a https://nexarg.space, eligiendo la plantilla y tocando "Obtener esta web"."""
 
 
-def instruccion_maestra():
-    nombre = os.environ.get("AGENTE_NOMBRE", "Luz")
+def instruccion_maestra(nombre_agente=None):
+    nombre = nombre_agente or os.environ.get("AGENTE_NOMBRE", "Luz")
     return f"""Sos {nombre}, la vendedora de NEX ARG que atiende el WhatsApp del negocio. Tu trabajo es ayudar y vender, como la mejor vendedora del local.
 
 CÓMO ESCRIBÍS (capa humana):
@@ -676,7 +679,7 @@ INFORMACIÓN DEL NEGOCIO:
 {datos_del_negocio()}"""
 
 
-def preguntar_a_claude(historial):
+def preguntar_a_claude(historial, nombre_agente=None):
     respuesta = requests.post(
         ANTHROPIC_URL,
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
@@ -684,7 +687,7 @@ def preguntar_a_claude(historial):
                  "content-type": "application/json"},
         json={"model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"),
               "max_tokens": 2000,
-              "system": instruccion_maestra(),
+              "system": instruccion_maestra(nombre_agente),
               "messages": list(historial)},
         timeout=60,
     )
@@ -707,15 +710,40 @@ def avisar_al_dueno(cliente, motivo, ultimo_mensaje):
                            f"La IA queda en pausa 2 horas en ese chat.")
 
 
-def responder_con_ia(remitente, recibido, message_id):
+def _contexto_memoria(remitente, phone_number_id, nombre):
+    """Busca el negocio y el contacto en Supabase. Si algo falla, devuelve (None, None)
+    y la IA sigue funcionando con la memoria en RAM."""
+    if not os.environ.get("SUPABASE_URL") or not os.environ.get("SUPABASE_SERVICE_KEY"):
+        return None, None
+    try:
+        pnid = phone_number_id or os.environ.get("PHONE_NUMBER_ID", "")
+        negocio = memoria.obtener_negocio(pnid)
+        if not negocio:
+            print(f"NEXARG AI: no hay negocio en ai_negocios con phone_number_id={pnid}")
+            return None, None
+        contacto = memoria.obtener_o_crear_contacto(negocio["id"], remitente, nombre)
+        return negocio, contacto
+    except Exception as error:
+        print("Supabase no disponible, uso memoria en RAM:", error)
+        return None, None
+
+
+def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nombre=None):
     with _lock_global:
         candado = _candados.setdefault(remitente, threading.Lock())
     with candado:
         try:
+            negocio, contacto = _contexto_memoria(remitente, phone_number_id, nombre)
+
             # Comando de prueba: "/reset" borra la memoria y saca la pausa.
             if recibido.strip().lower() == "/reset":
                 _historiales.pop(remitente, None)
                 _pausados.pop(remitente, None)
+                if contacto:
+                    try:
+                        memoria.borrar_historial(contacto["id"])
+                    except Exception as error:
+                        print("No se pudo borrar el historial en Supabase:", error)
                 enviar_whatsapp(remitente, "🔄 Memoria borrada. Empecemos de nuevo.")
                 return
 
@@ -724,15 +752,35 @@ def responder_con_ia(remitente, recibido, message_id):
                 return
 
             marcar_leido_y_escribiendo(message_id)
-            historial = _historiales.setdefault(remitente, deque(maxlen=HISTORIAL_MAX))
-            historial.append({"role": "user", "content": recibido[:2000]})
-            # La conversación tiene que empezar con un mensaje del cliente.
-            while historial and historial[0]["role"] != "user":
-                historial.popleft()
 
-            texto_ia = preguntar_a_claude(historial)
+            # 1) Memoria permanente (Supabase)
+            historial = None
+            if contacto:
+                try:
+                    nuevo = memoria.guardar_mensaje(negocio["id"], contacto["id"], "user",
+                                                    recibido[:2000], wa_message_id=message_id)
+                    if not nuevo:
+                        print(f"Mensaje {message_id} ya procesado, no respondo de nuevo.")
+                        return
+                    historial = memoria.cargar_historial(contacto["id"], HISTORIAL_MAX)
+                except Exception as error:
+                    print("Falló Supabase, uso memoria en RAM:", error)
+                    contacto = None
+
+            # 2) Respaldo en RAM
+            historial_ram = _historiales.setdefault(remitente, deque(maxlen=HISTORIAL_MAX))
+            if not contacto:
+                historial_ram.append({"role": "user", "content": recibido[:2000]})
+                # La conversación tiene que empezar con un mensaje del cliente.
+                while historial_ram and historial_ram[0]["role"] != "user":
+                    historial_ram.popleft()
+                historial = list(historial_ram)
+
+            nombre_agente = negocio.get("nombre_agente") if negocio else None
+            texto_ia = preguntar_a_claude(historial, nombre_agente)
             if not texto_ia:
-                historial.pop()
+                if not contacto and historial_ram:
+                    historial_ram.pop()
                 enviar_whatsapp(remitente, "Perdón, se me cortó algo 😅 ¿Me lo repetís en un ratito?")
                 return
 
@@ -745,7 +793,14 @@ def responder_con_ia(remitente, recibido, message_id):
                 motivo = etiqueta.strip("[]").replace("DERIVAR", "").strip(" :") or "sin detalle"
                 texto_ia = texto_ia.replace(etiqueta, "").strip()
 
-            historial.append({"role": "assistant", "content": texto_ia})
+            # Guardar la respuesta de la IA
+            if contacto:
+                try:
+                    memoria.guardar_mensaje(negocio["id"], contacto["id"], "assistant", texto_ia)
+                except Exception as error:
+                    print("No se pudo guardar la respuesta en Supabase:", error)
+            else:
+                historial_ram.append({"role": "assistant", "content": texto_ia})
 
             # Toque humano: varios mensajes cortos, con una pausa según el largo.
             partes = [p.strip() for p in texto_ia.split("|||") if p.strip()][:3]
@@ -782,6 +837,9 @@ def recibir_whatsapp():
         for entrada in datos.get("entry", []):
             for cambio in entrada.get("changes", []):
                 valor = cambio.get("value", {})
+                phone_number_id = valor.get("metadata", {}).get("phone_number_id")
+                nombres = {c.get("wa_id"): c.get("profile", {}).get("name")
+                           for c in valor.get("contacts", [])}
                 for mensaje in valor.get("messages", []):
                     mid = mensaje.get("id")
                     with _lock_global:
@@ -795,7 +853,9 @@ def recibir_whatsapp():
                         recibido = mensaje["text"]["body"]
                         print(f"Mensaje de {remitente}: {recibido}")
                         threading.Thread(target=responder_con_ia,
-                                         args=(remitente, recibido, mid), daemon=True).start()
+                                         args=(remitente, recibido, mid, phone_number_id,
+                                               nombres.get(remitente)),
+                                         daemon=True).start()
                     else:
                         enviar_whatsapp(remitente, "Por ahora leo solo mensajes de texto 😊 ¿Me lo escribís?")
     except Exception as error:
@@ -805,4 +865,4 @@ def recibir_whatsapp():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
