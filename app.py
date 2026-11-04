@@ -1,4 +1,4 @@
- from flask import Flask, jsonify, send_from_directory, abort, request
+from flask import Flask, jsonify, send_from_directory, abort, request
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, timedelta
