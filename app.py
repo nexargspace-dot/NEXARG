@@ -674,6 +674,7 @@ REGLAS DE ORO:
 - Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
 - Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NEX ARG y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
 - No hables de temas que no tengan que ver con el negocio; volvé amablemente a lo que el cliente necesita.
+- Los mensajes que empiezan con [Audio transcripto] son audios que el cliente te mandó. Respondé como si lo hubieras escuchado (nunca digas "transcripción" ni muestres esa etiqueta). Si alguna parte no tiene sentido, preguntá con naturalidad qué quiso decir.
 
 INFORMACIÓN DEL NEGOCIO:
 {datos_del_negocio()}"""
@@ -728,7 +729,7 @@ def _contexto_memoria(remitente, phone_number_id, nombre):
         return None, None
 
 
-def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nombre=None):
+def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nombre=None, tipo="texto"):
     with _lock_global:
         candado = _candados.setdefault(remitente, threading.Lock())
     with candado:
@@ -758,7 +759,8 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
             if contacto:
                 try:
                     nuevo = memoria.guardar_mensaje(negocio["id"], contacto["id"], "user",
-                                                    recibido[:2000], wa_message_id=message_id)
+                                                    recibido[:2000], tipo=tipo,
+                                                    wa_message_id=message_id)
                     if not nuevo:
                         print(f"Mensaje {message_id} ya procesado, no respondo de nuevo.")
                         return
@@ -817,6 +819,74 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
             print("Error en responder_con_ia:", error)
 
 
+# ------------------------------------------------------------
+# NEXARG AI - FASE 5: AUDIOS
+# WhatsApp (audio) -> se descarga de Meta -> Groq Whisper lo pasa a texto -> Luz responde
+#
+# Variables de entorno en Render:
+#   GROQ_API_KEY     -> clave de console.groq.com
+#   AUDIO_IDIOMA     -> (opcional) ej "es". Si no está, Whisper detecta el idioma solo.
+# ------------------------------------------------------------
+GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+AUDIO_MAX_BYTES = 20 * 1024 * 1024   # Groq acepta hasta ~25 MB; un audio de WhatsApp pesa mucho menos
+
+
+def descargar_audio_whatsapp(media_id):
+    """Pide a Meta la URL del audio y lo descarga. Devuelve (bytes, mime_type)."""
+    info = requests.get(f"{GRAPH_URL}/{media_id}", headers=_headers_meta(), timeout=15)
+    info.raise_for_status()
+    datos = info.json()
+    archivo = requests.get(datos["url"],
+                           headers={"Authorization": f"Bearer {os.environ['WHATSAPP_TOKEN']}"},
+                           timeout=30)
+    archivo.raise_for_status()
+    return archivo.content, datos.get("mime_type", "audio/ogg")
+
+
+def transcribir_audio(contenido, mime_type):
+    """Manda el audio a Groq (Whisper) y devuelve el texto."""
+    extension = "mp3" if "mpeg" in mime_type else "m4a" if "mp4" in mime_type else "ogg"
+    campos = {"model": os.environ.get("GROQ_MODELO_AUDIO", "whisper-large-v3-turbo"),
+              "response_format": "json", "temperature": "0"}
+    if os.environ.get("AUDIO_IDIOMA"):
+        campos["language"] = os.environ["AUDIO_IDIOMA"]
+    r = requests.post(GROQ_URL,
+                      headers={"Authorization": f"Bearer {os.environ['GROQ_API_KEY']}"},
+                      data=campos,
+                      files={"file": (f"audio.{extension}", contenido, mime_type.split(";")[0])},
+                      timeout=60)
+    if r.status_code >= 400:
+        print("Error de Groq:", r.status_code, r.text)
+        return None
+    return (r.json().get("text") or "").strip()
+
+
+def procesar_audio(remitente, media_id, message_id, phone_number_id=None, nombre=None):
+    try:
+        if _pausados.get(remitente, 0) > time.time():
+            print(f"Chat {remitente} en pausa (lo atiende el dueño), no transcribo.")
+            return
+        if not os.environ.get("GROQ_API_KEY"):
+            enviar_whatsapp(remitente, "Todavía no puedo escuchar audios 🙈 ¿Me lo escribís?")
+            return
+        marcar_leido_y_escribiendo(message_id)
+        contenido, mime_type = descargar_audio_whatsapp(media_id)
+        if len(contenido) > AUDIO_MAX_BYTES:
+            enviar_whatsapp(remitente, "Uy, ese audio es muy largo para mí 😅 ¿Me lo resumís en uno más corto o por escrito?")
+            return
+        texto = transcribir_audio(contenido, mime_type)
+        if not texto:
+            enviar_whatsapp(remitente, "No llegué a escuchar bien el audio 😅 ¿Me lo mandás de nuevo o me lo escribís?")
+            return
+        print(f"Audio de {remitente} transcripto: {texto}")
+        # Se le avisa a la IA que vino de un audio (puede haber palabras mal entendidas).
+        responder_con_ia(remitente, f"[Audio transcripto] {texto}", message_id,
+                         phone_number_id, nombre, tipo="audio")
+    except Exception as error:
+        print("Error procesando audio:", error)
+        enviar_whatsapp(remitente, "No pude escuchar el audio 😅 ¿Me lo escribís?")
+
+
 @app.route('/webhook', methods=['GET'])
 def verificar_webhook():
     # Meta llama a esta ruta UNA vez para comprobar que el servidor es tuyo.
@@ -856,8 +926,15 @@ def recibir_whatsapp():
                                          args=(remitente, recibido, mid, phone_number_id,
                                                nombres.get(remitente)),
                                          daemon=True).start()
+                    elif mensaje.get("type") == "audio":
+                        media_id = mensaje.get("audio", {}).get("id")
+                        print(f"Audio de {remitente} (media {media_id})")
+                        threading.Thread(target=procesar_audio,
+                                         args=(remitente, media_id, mid, phone_number_id,
+                                               nombres.get(remitente)),
+                                         daemon=True).start()
                     else:
-                        enviar_whatsapp(remitente, "Por ahora leo solo mensajes de texto 😊 ¿Me lo escribís?")
+                        enviar_whatsapp(remitente, "Por ahora leo mensajes de texto y audios 😊 ¿Me lo escribís?")
     except Exception as error:
         # Nunca devolvemos error a Meta: si no, reintenta el mismo mensaje muchas veces.
         print("Error procesando el webhook:", error)
@@ -865,4 +942,4 @@ def recibir_whatsapp():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
