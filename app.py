@@ -12,11 +12,11 @@ import threading
 import time
 from collections import deque, OrderedDict
 
-import requests  # NEXARG AI: para hablar con WhatsApp y con Claude
+import requests  # NYMXAR AI: para hablar con WhatsApp y con Claude
 
 import seguridad
 from seguridad import requiere_admin, limitar, texto, imagen_valida, hash_token
-import memoria  # NEXARG AI: memoria permanente de conversaciones en Supabase
+import memoria  # NYMXAR AI: memoria permanente de conversaciones en Supabase
 
 # Solo API: no se sirve ninguna carpeta como estática (el frontend vive en Netlify/Cloudflare).
 app = Flask(__name__, static_folder=None)
@@ -26,7 +26,7 @@ app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1 MB por request
 CORS(app, resources={r"/api/*": {
     "origins": os.environ.get(
         'CORS_ORIGINS',
-         'https://nexarg.space,https://www.nexarg.space,http://localhost:5000,http://127.0.0.1:5000,http://127.0.0.1:5500'
+         'https://nymxar.com,https://www.nymxar.com,https://nexarg.space,https://www.nexarg.space,http://localhost:5000,http://127.0.0.1:5000,http://127.0.0.1:5500'
     ).split(','),
     "allow_headers": ["Content-Type", "Authorization", "Accept"],
 }})
@@ -190,7 +190,7 @@ init_db()
 
 @app.route('/api/health')
 def health():
-    return jsonify({'ok': True, 'service': 'nexarg-api'})
+    return jsonify({'ok': True, 'service': 'nymxar-api'})
 
 @app.route('/assets/<path:nombre>')
 def servir_imagen(nombre):
@@ -210,8 +210,8 @@ def favicon_512():
 @app.route('/site.webmanifest')
 def site_manifest():
     return jsonify({
-        "name": "NEX ARG",
-        "short_name": "NEXARG",
+        "name": "NYMXAR",
+        "short_name": "NYMXAR",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#0b0b0f",
@@ -439,7 +439,7 @@ def tienda_cancelar_pedido_cliente(tienda, order_id):
     return _cambiar_estado_tienda(t, order_id, 'CANCELADO', cancel_token=token)
 
 # ------------------------------------------------------------
-# PEDIDOS DE WEBS NEX ARG
+# PEDIDOS DE WEBS NYMXAR
 # ------------------------------------------------------------
 @app.route('/api/pedidos', methods=['GET'])
 @requiere_admin
@@ -538,21 +538,21 @@ def cambiar_estado(id):
     return jsonify({"ok": True})
 
 # ------------------------------------------------------------
-# NEXARG AI - FASE 3: EL CEREBRO
+# NYMXAR AI - FASE 3: EL CEREBRO
 # WhatsApp -> este servidor -> Claude (con la instrucción maestra) -> WhatsApp
 #
 # Variables de entorno en Render (Environment):
 #   WHATSAPP_TOKEN     -> token permanente de Meta
 #   PHONE_NUMBER_ID    -> "Phone Number ID" del número
-#   VERIFY_TOKEN       -> palabra secreta del webhook (nexarg-verifica-2026)
+#   VERIFY_TOKEN       -> palabra secreta del webhook (solo en Render, nunca en el código)
 #   ANTHROPIC_API_KEY  -> clave de la API de Claude (console.anthropic.com)
-#   DUENO_WHATSAPP     -> número del dueño para avisos, sin + ni espacios (ej: 541151323616)
+#   DUENO_WHATSAPP     -> tu celu PERSONAL para avisos (NO el número de Luz), sin + ni espacios
 #   AGENTE_NOMBRE      -> (opcional) nombre de la vendedora. Por defecto: Luz
 #   CLAUDE_MODEL       -> (opcional) modelo. Por defecto: claude-haiku-5-5
-#   SUPABASE_URL          -> URL del proyecto Supabase "NEXARG AI"
+#   SUPABASE_URL          -> URL del proyecto Supabase "NYMXAR AI"
 #   SUPABASE_SERVICE_KEY  -> secret key (sb_secret_...) o service_role. Solo acá, nunca en GitHub.
 # ------------------------------------------------------------
-GRAPH_URL = "https://graph.facebook.com/v25.0"
+GRAPH_URL = "https://graph.facebook.com/v27.0"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
 # FASE 4: la memoria de conversaciones vive en Supabase (memoria.py) y no se borra.
@@ -608,7 +608,7 @@ def marcar_leido_y_escribiendo(message_id):
 
 
 # ------------------------------------------------------------
-# DATOS DEL NEGOCIO (capa 3). Por ahora: NEX ARG.
+# DATOS DEL NEGOCIO (capa 3). Por ahora: NYMXAR.
 # Más adelante cada negocio carga esto desde su panel.
 # ------------------------------------------------------------
 def datos_del_negocio():
@@ -628,8 +628,8 @@ def datos_del_negocio():
     except Exception as error:
         print("No se pudo leer el catálogo:", error)
         catalogo = "(catálogo no disponible ahora)"
-    return f"""NEGOCIO: NEX ARG — webs premium por rubro para negocios y PYMEs (Quilmes, Buenos Aires, Argentina).
-Web: https://nexarg.space (ahí está el catálogo completo y se compra online).
+    return f"""NEGOCIO: NYMXAR — webs premium por rubro para negocios y PYMEs (Quilmes, Buenos Aires, Argentina).
+Web: https://nymxar.com (ahí está el catálogo completo y se compra online).
 
 CATÁLOGO (precios finales, no inventes otros):
 {catalogo}
@@ -640,17 +640,17 @@ POLÍTICAS:
 - Cambios post-entrega: solo errores de carga (foto, texto o teléfono mal) avisados dentro de las 2 horas hábiles de enviado el formulario.
 - Hosting: queda en la cuenta del propio cliente.
 - Dominio propio: se vende aparte e incluye 1 año gratis.
-- Cuotas: con la tarjeta o el banco del cliente (no financia NEX ARG).
+- Cuotas: con la tarjeta o el banco del cliente (no financia NYMXAR).
 - Mantenimiento mensual opcional para cambios chicos (fotos, precios, textos), no rediseños.
 - Garantía: 100% ante errores reales del sitio, con arreglo gratis o devolución.
 - Extra opcional: sistema de pedidos/turnos con panel para el dueño y pagos con Mercado Pago.
 
-CÓMO SE COMPRA: entrando a https://nexarg.space, eligiendo la plantilla y tocando "Obtener esta web"."""
+CÓMO SE COMPRA: entrando a https://nymxar.com, eligiendo la plantilla y tocando "Obtener esta web"."""
 
 
 def instruccion_maestra(nombre_agente=None):
     nombre = nombre_agente or os.environ.get("AGENTE_NOMBRE", "Luz")
-    return f"""Sos {nombre}, la vendedora de NEX ARG que atiende el WhatsApp del negocio. Tu trabajo es ayudar y vender, como la mejor vendedora del local.
+    return f"""Sos {nombre}, la vendedora de NYMXAR que atiende el WhatsApp del negocio. Tu trabajo es ayudar y vender, como la mejor vendedora del local.
 
 CÓMO ESCRIBÍS (capa humana):
 - Escribís como una persona real por WhatsApp: mensajes cortos, naturales, cálidos.
@@ -672,7 +672,7 @@ CÓMO VENDÉS (capa de ventas):
 REGLAS DE ORO:
 - NUNCA inventes precios, plazos, productos, descuentos ni datos que no estén en la información del negocio.
 - Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
-- Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NEX ARG y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
+- Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NYMXAR y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
 - No hables de temas que no tengan que ver con el negocio; volvé amablemente a lo que el cliente necesita.
 - Los mensajes que empiezan con [Audio transcripto] son audios que el cliente te mandó. Respondé como si lo hubieras escuchado (nunca digas "transcripción" ni muestres esa etiqueta). Si alguna parte no tiene sentido, preguntá con naturalidad qué quiso decir.
 
@@ -705,7 +705,7 @@ def avisar_al_dueno(cliente, motivo, ultimo_mensaje):
     if not dueno:
         print("DERIVACIÓN sin DUENO_WHATSAPP configurado:", cliente, motivo)
         return
-    enviar_whatsapp(dueno, f"🔔 NEXARG AI necesita que atiendas este chat\n"
+    enviar_whatsapp(dueno, f"🔔 NYMXAR AI necesita que atiendas este chat\n"
                            f"Cliente: +{cliente}\nMotivo: {motivo}\n"
                            f"Último mensaje: \"{ultimo_mensaje[:300]}\"\n\n"
                            f"La IA queda en pausa 2 horas en ese chat.")
@@ -720,7 +720,7 @@ def _contexto_memoria(remitente, phone_number_id, nombre):
         pnid = phone_number_id or os.environ.get("PHONE_NUMBER_ID", "")
         negocio = memoria.obtener_negocio(pnid)
         if not negocio:
-            print(f"NEXARG AI: no hay negocio en ai_negocios con phone_number_id={pnid}")
+            print(f"NYMXAR AI: no hay negocio en ai_negocios con phone_number_id={pnid}")
             return None, None
         contacto = memoria.obtener_o_crear_contacto(negocio["id"], remitente, nombre)
         return negocio, contacto
@@ -820,7 +820,7 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
 
 
 # ------------------------------------------------------------
-# NEXARG AI - FASE 5: AUDIOS
+# NYMXAR AI - FASE 5: AUDIOS
 # WhatsApp (audio) -> se descarga de Meta -> Groq Whisper lo pasa a texto -> Luz responde
 #
 # Variables de entorno en Render:
@@ -942,4 +942,4 @@ def recibir_whatsapp():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
