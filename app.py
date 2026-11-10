@@ -4,6 +4,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from datetime import datetime, timedelta
 import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
@@ -608,6 +609,87 @@ def marcar_leido_y_escribiendo(message_id):
 
 
 # ------------------------------------------------------------
+# FICHAS DE PLANTILLAS: lo que Luz MUESTRA (foto + ficha + link).
+# Para sumar una plantilla nueva, agregala acá con sus fotos.
+# Las fotos tienen que ser públicas (https), JPG o PNG, de menos de 5 MB.
+# Tip: sacá capturas lindas y subilas a nymxar-web/assets/luz/
+# ------------------------------------------------------------
+SITIO = "https://nymxar.com"
+
+PLANTILLAS_LUZ = {
+    "aurea": {
+        "nombre": "Aurea · Salón de Belleza",
+        "precio": "$310.000",
+        "imagenes": [f"{SITIO}/plantillas/peluqueria/01-peluqueria/assets/img-hero.png"],
+        "demo": f"{SITIO}/plantillas/peluqueria/01-peluqueria/index.html",
+        "estilo": "Editorial y elegante, tonos bronce y vino, tipografía grande.",
+        "secciones": "Inicio, Reservas, Boutique (catálogo con carrito), Opiniones, Preguntas frecuentes y Contacto.",
+        "incluye": "Carrito de compras, calendario de turnos conectado a WhatsApp y panel de administración "
+                   "(pedidos, turnos, clientes, productos y stock, servicios, destacado y galería).",
+    },
+    "lumina": {
+        "nombre": "Lumina · Hair Atelier",
+        "precio": "$312.000",
+        "imagenes": [f"{SITIO}/plantillas/peluqueria/02-peluqueria/assets/03.jpg",
+                     f"{SITIO}/plantillas/peluqueria/02-peluqueria/assets/02.jpg"],
+        "demo": f"{SITIO}/plantillas/peluqueria/02-peluqueria/index.html",
+        "estilo": "Oscura y editorial, detalles en rosa, hero a pantalla completa con fotos que rotan.",
+        "secciones": "Inicio, Galería en carrusel, Producto destacado con video, Catálogo con carrito, "
+                     "Servicios, Quiénes somos y Contacto.",
+        "incluye": "Carrito de compras, turnos online y panel de administración "
+                   "(pedidos, turnos, clientes, productos y stock, galería y video).",
+    },
+}
+MAX_IMAGENES_POR_RESPUESTA = 2
+
+
+def fichas_para_luz():
+    lineas = []
+    for clave, f in PLANTILLAS_LUZ.items():
+        lineas.append(f"[{clave}] {f['nombre']} — {f['precio']}\n  Estilo: {f['estilo']}\n"
+                      f"  Secciones: {f['secciones']}\n  Incluye: {f['incluye']}\n  Ver demo: {f['demo']}")
+    return "\n".join(lineas)
+
+
+def caption_plantilla(f):
+    texto = (f"✨ *{f['nombre']}* — {f['precio']}\n\n"
+             f"{f['estilo']}\n\n"
+             f"*Secciones:* {f['secciones']}\n\n"
+             f"*Incluye:* {f['incluye']}\n\n"
+             f"👉 Mirala en vivo: {f['demo']}")
+    return texto[:1024]  # WhatsApp corta el caption en 1024 caracteres
+
+
+def enviar_imagen_whatsapp(destino, url, caption=None):
+    imagen = {"link": url}
+    if caption:
+        imagen["caption"] = caption
+    r = requests.post(
+        f"{GRAPH_URL}/{os.environ['PHONE_NUMBER_ID']}/messages",
+        headers=_headers_meta(),
+        json={"messaging_product": "whatsapp", "to": normalizar_numero_ar(destino),
+              "type": "image", "image": imagen},
+        timeout=20,
+    )
+    if r.status_code >= 400:
+        print("Error al enviar imagen a WhatsApp:", r.status_code, r.text)
+    return r
+
+
+def mostrar_plantilla(destino, clave):
+    f = PLANTILLAS_LUZ.get(clave)
+    if not f:
+        print("Luz pidió mostrar una plantilla que no existe:", clave)
+        return
+    fotos = f["imagenes"]
+    # La primera foto lleva la ficha completa; las demás van solas.
+    enviar_imagen_whatsapp(destino, fotos[0], caption_plantilla(f))
+    for url in fotos[1:MAX_IMAGENES_POR_RESPUESTA]:
+        time.sleep(1)
+        enviar_imagen_whatsapp(destino, url)
+
+
+# ------------------------------------------------------------
 # DATOS DEL NEGOCIO (capa 3). Por ahora: NYMXAR.
 # Más adelante cada negocio carga esto desde su panel.
 # ------------------------------------------------------------
@@ -645,7 +727,10 @@ POLÍTICAS:
 - Garantía: 100% ante errores reales del sitio, con arreglo gratis o devolución.
 - Extra opcional: sistema de pedidos/turnos con panel para el dueño y pagos con Mercado Pago.
 
-CÓMO SE COMPRA: entrando a https://nymxar.com, eligiendo la plantilla y tocando "Obtener esta web"."""
+CÓMO SE COMPRA: entrando a https://nymxar.com, eligiendo la plantilla y tocando "Obtener esta web".
+
+FICHAS DE PLANTILLAS (la clave entre corchetes es la que usás en [MOSTRAR: clave]):
+{fichas_para_luz()}"""
 
 
 def instruccion_maestra(nombre_agente=None):
@@ -674,6 +759,7 @@ REGLAS DE ORO:
 - Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
 - Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NYMXAR y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
 - No hables de temas que no tengan que ver con el negocio; volvé amablemente a lo que el cliente necesita.
+- MOSTRAR PLANTILLAS: cuando el cliente quiera ver una web, pregunte cómo es, o diga que le interesa una plantilla, agregá al FINAL de tu respuesta la etiqueta [MOSTRAR: clave] (ej: [MOSTRAR: lumina]). El sistema le manda automáticamente la foto con la ficha (secciones, qué incluye, precio y link a la demo). Por eso tu texto tiene que ser corto, tipo "Te paso cómo es Lumina 👇", sin repetir la ficha. Máximo 2 plantillas por respuesta, y no muestres de nuevo una que ya le mostraste salvo que la pida. Las notas "(Le mostré foto y ficha de: ...)" que ves en tus mensajes anteriores las agrega el sistema: nunca las escribas vos. Si no sabe cuál elegir, preguntale qué estilo le gusta (claro y elegante → Aurea, oscuro y moderno → Lumina) antes de mostrar.
 - Los mensajes que empiezan con [Audio transcripto] son audios que el cliente te mandó. Respondé como si lo hubieras escuchado (nunca digas "transcripción" ni muestres esa etiqueta). Si alguna parte no tiene sentido, preguntá con naturalidad qué quiso decir.
 
 INFORMACIÓN DEL NEGOCIO:
@@ -795,14 +881,29 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                 motivo = etiqueta.strip("[]").replace("DERIVAR", "").strip(" :") or "sin detalle"
                 texto_ia = texto_ia.replace(etiqueta, "").strip()
 
+            # ¿Pidió mostrar plantillas? [MOSTRAR: lumina]
+            mostrar = []
+            for m in re.finditer(r"\[MOSTRAR:\s*([a-zA-Z0-9_-]+)\s*\]", texto_ia):
+                clave = m.group(1).lower()
+                if clave in PLANTILLAS_LUZ and clave not in mostrar:
+                    mostrar.append(clave)
+            texto_ia = re.sub(r"\[MOSTRAR:[^\]]*\]", "", texto_ia).strip()
+            mostrar = mostrar[:MAX_IMAGENES_POR_RESPUESTA]
+
+            # Lo que se guarda en memoria incluye una nota para que Luz recuerde qué mostró.
+            texto_memoria = texto_ia
+            if mostrar:
+                nombres_mostrados = ", ".join(PLANTILLAS_LUZ[c]["nombre"] for c in mostrar)
+                texto_memoria = (texto_ia + f"\n(Le mostré foto y ficha de: {nombres_mostrados})").strip()
+
             # Guardar la respuesta de la IA
             if contacto:
                 try:
-                    memoria.guardar_mensaje(negocio["id"], contacto["id"], "assistant", texto_ia)
+                    memoria.guardar_mensaje(negocio["id"], contacto["id"], "assistant", texto_memoria)
                 except Exception as error:
                     print("No se pudo guardar la respuesta en Supabase:", error)
             else:
-                historial_ram.append({"role": "assistant", "content": texto_ia})
+                historial_ram.append({"role": "assistant", "content": texto_memoria})
 
             # Toque humano: varios mensajes cortos, con una pausa según el largo.
             partes = [p.strip() for p in texto_ia.split("|||") if p.strip()][:3]
@@ -811,6 +912,12 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                     marcar_leido_y_escribiendo(message_id)
                     time.sleep(min(1.5 + len(parte) / 40, 6))
                 enviar_whatsapp(remitente, parte)
+
+            # Después del texto, las fotos con su ficha.
+            for clave in mostrar:
+                marcar_leido_y_escribiendo(message_id)
+                time.sleep(1.5)
+                mostrar_plantilla(remitente, clave)
 
             if motivo:
                 _pausados[remitente] = time.time() + PAUSA_DERIVACION_SEG
@@ -942,4 +1049,4 @@ def recibir_whatsapp():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
-    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port) 
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1', host='0.0.0.0', port=port)
