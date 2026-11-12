@@ -813,6 +813,7 @@ CÓMO VENDÉS (capa de ventas):
 - Cuando está listo, le pasás el link para comprar y le decís el siguiente paso.
 
 REGLAS DE ORO:
+- Tu respuesta es SOLO el mensaje que le llega al cliente por WhatsApp. Nunca escribas lo que pensás, notas para vos, análisis, borradores ni texto en inglés. Pensá en silencio y escribí directamente el mensaje final.
 - NUNCA inventes precios, plazos, productos, descuentos ni datos que no estén en la información del negocio.
 - Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
 - Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NYMXAR y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
@@ -833,6 +834,7 @@ def instruccion_dueno(nombre_agente=None):
     return f"""Sos {nombre}, la asistente de NYMXAR. Ahora NO estás hablando con un cliente: estás hablando con Noe, la dueña de NYMXAR, que es tu jefa.
 
 CON NOE:
+- Tu respuesta es SOLO el mensaje que le llega a Noe. Nunca escribas lo que pensás, notas para vos, análisis ni texto en inglés.
 - No le vendas, no le muestres el catálogo salvo que te lo pida, y nunca uses [DERIVAR], [FACTURA] ni [IGNORAR].
 - Charlás de igual a igual, con confianza y buena onda, mensajes cortos como por WhatsApp. Podés separar en 2 o 3 mensajes con |||.
 - Respondés sus consultas sobre el negocio (catálogo, precios, políticas, cómo atendés a los clientes).
@@ -852,16 +854,73 @@ INFORMACIÓN DEL NEGOCIO:
 {datos_del_negocio()}"""
 
 
+# Frases típicas de cuando el modelo "piensa en voz alta" en vez de responder.
+_MARCAS_FINAL = re.compile(r"(?:correct\s+)?final\s+(?:answer|response|reply)\s*:", re.IGNORECASE)
+_MARCAS_RAZONAMIENTO = re.compile(
+    r"\b(the user|i need to|i should|i'll write|let me|wait[:,]|hmm|the system|the tag|tags at|"
+    r"per response|already shown|haven't been shown|draft|reasoning|the customer wants|noe wants)\b",
+    re.IGNORECASE)
+
+
+def limpiar_respuesta(texto):
+    """Saca razonamientos internos que a veces se cuelan en la respuesta.
+    Devuelve (texto_limpio, hubo_fuga)."""
+    if not texto:
+        return texto, False
+    fuga = False
+    # Si escribió "Final answer:", nos quedamos con lo que viene después.
+    partes_final = _MARCAS_FINAL.split(texto)
+    if len(partes_final) > 1:
+        texto = partes_final[-1].strip()
+        fuga = True
+    # Descarta los párrafos que suenan a razonamiento (respetando los mensajes separados por |||).
+    buenos = []
+    for mensaje in texto.split("|||"):
+        parrafos = [pa.strip() for pa in re.split(r"\n\s*\n", mensaje) if pa.strip()]
+        sanos = [pa for pa in parrafos if not _MARCAS_RAZONAMIENTO.search(pa)]
+        if len(sanos) != len(parrafos):
+            fuga = True
+        if sanos:
+            buenos.append("\n\n".join(sanos))
+    # Las etiquetas [MOSTRAR]/[DERIVAR]/etc. se conservan aunque estén en un bloque descartado.
+    etiquetas = re.findall(r"\[(?:MOSTRAR|DERIVAR|FACTURA|IGNORAR)[^\]]*\]", texto, flags=re.IGNORECASE)
+    limpio = "|||".join(buenos)
+    for etiqueta in etiquetas:
+        if etiqueta not in limpio:
+            limpio += " " + etiqueta
+    return limpio.strip(), fuga
+
+
 def preguntar_a_claude(historial, nombre_agente=None, sistema=None):
+    texto = _llamar_claude(historial, nombre_agente, sistema)
+    limpio, fuga = limpiar_respuesta(texto)
+    solo_etiquetas = re.sub(r"\[[^\]]*\]", "", limpio or "").strip() == ""
+    if fuga and (not limpio or solo_etiquetas) and "[IGNORAR" not in (limpio or "").upper():
+        # Se filtró razonamiento y no quedó nada para mandar: reintento una vez.
+        print("Se filtró razonamiento, reintento:", (texto or "")[:300])
+        aviso = {"role": "user", "content": "(Sistema: respondé de nuevo SOLO con el mensaje final para WhatsApp, "
+                                            "en español, sin razonamientos.)"}
+        texto = _llamar_claude(list(historial) + [{"role": "assistant", "content": "..."}, aviso],
+                               nombre_agente, sistema)
+        limpio, _ = limpiar_respuesta(texto)
+    elif fuga:
+        print("Se filtró razonamiento, lo limpié:", (texto or "")[:300])
+    return limpio
+
+
+def _llamar_claude(historial, nombre_agente=None, sistema=None):
     respuesta = requests.post(
         ANTHROPIC_URL,
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
                  "anthropic-version": "2023-06-01",
                  "content-type": "application/json"},
         json={"model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"),
-              "max_tokens": 2000,
+              "max_tokens": 3000,
               "system": sistema or instruccion_maestra(nombre_agente),
-              "messages": list(historial)},
+              "messages": list(historial),
+              # LUZ_PENSAR=1 en Render: piensa en un bloque aparte que nunca se manda al cliente.
+              **({"thinking": {"type": "enabled", "budget_tokens": 1024}}
+                 if os.environ.get("LUZ_PENSAR") == "1" else {})},
         timeout=60,
     )
     if respuesta.status_code >= 400:
