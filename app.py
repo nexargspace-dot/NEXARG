@@ -178,6 +178,7 @@ def init_db():
     plantillas = [
         ('peluqueria-aurea','Aurea - Salón de Belleza','servicios','peluqueria',310000,'$310.000','turnos','./plantillas/peluqueria/01-peluqueria/assets/img-hero.png','Diseño exclusivo para peluquerías'),
         ('peluqueria-lumina','Lumina - Salón de Belleza','servicios','peluqueria',312000,'$312.000','turnos','./plantillas/peluqueria/02-peluqueria/assets/03.jpg','Diseño oscuro y editorial para salones de belleza'),
+        ('peluqueria-lira','Lira - Salón de Belleza','servicios','peluqueria',314000,'$314.000','turnos','./plantillas/peluqueria/03-peluqueria/assets/01-lira.jpg','Diseño editorial con video en el inicio y menú a pantalla completa'),
         ('minimal-studio','Minimal Studio','inmobiliarias','alquileres',352000,'$352.000','inmobiliaria','https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=600&q=80&auto=format&fit=crop','Enfoque minimalista para galerías'),
         ('boutique-concept','Boutique Concept','comercios','cosmeticos',348000,'$348.000','mayorista','https://images.unsplash.com/photo-1441986300917-64674bd600d8?w=600&q=80&auto=format&fit=crop','Ideal para indumentaria y catálogo visual'),
         ('plantilla-4','Nueva Plantilla 4','gastronomia','resto',355000,'$355.000','ecommerce','./plantillas/nueva-4/assets/foto-principal.jpg','Descripción corta de la web'),
@@ -552,6 +553,12 @@ def cambiar_estado(id):
 #   CLAUDE_MODEL       -> (opcional) modelo. Por defecto: claude-haiku-5-5
 #   SUPABASE_URL          -> URL del proyecto Supabase "NYMXAR AI"
 #   SUPABASE_SERVICE_KEY  -> secret key (sb_secret_...) o service_role. Solo acá, nunca en GitHub.
+#   DUENO_NUMEROS      -> (opcional) otros números tuyos, separados por coma. Con DUENO_WHATSAPP
+#                         forman la lista de "dueña": Luz no les vende ni los deriva, los asiste.
+#   NUMEROS_IGNORAR    -> (opcional) números a los que Luz nunca contesta (promos automáticas),
+#                         separados por coma. Ej: 5491122616666 (promos de Movistar)
+#   CLIENTES_SUPABASE_URL -> URL del proyecto NEXARG-CLIENTES (el de las ventas de webs)
+#   CLIENTES_SUPABASE_KEY -> secret key de ESE proyecto. Sirve para verificar pedidos al pedir factura.
 # ------------------------------------------------------------
 GRAPH_URL = "https://graph.facebook.com/v27.0"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -574,6 +581,45 @@ def normalizar_numero_ar(numero):
     if numero.startswith("549") and len(numero) == 13:
         return "54" + numero[3:]
     return numero
+
+
+def _solo_digitos(numero):
+    return re.sub(r"\D", "", numero or "")
+
+
+def _lista_numeros(*valores):
+    numeros = set()
+    for valor in valores:
+        for n in (valor or "").split(","):
+            d = _solo_digitos(n)
+            if d:
+                numeros.add(normalizar_numero_ar(d))
+    return numeros
+
+
+def es_dueno(numero):
+    # La dueña: DUENO_WHATSAPP + DUENO_NUMEROS. Con ella Luz no vende ni deriva.
+    return normalizar_numero_ar(_solo_digitos(numero)) in _lista_numeros(
+        os.environ.get("DUENO_WHATSAPP"), os.environ.get("DUENO_NUMEROS"))
+
+
+def es_ignorado(numero):
+    # Remitentes automáticos (promos, bancos...) a los que Luz nunca contesta.
+    return normalizar_numero_ar(_solo_digitos(numero)) in _lista_numeros(
+        os.environ.get("NUMEROS_IGNORAR", "5491122616666"))
+
+
+def _quitar_pausa(numero):
+    objetivo = normalizar_numero_ar(_solo_digitos(numero))
+    quitados = [k for k in list(_pausados) if normalizar_numero_ar(_solo_digitos(k)) == objetivo]
+    for k in quitados:
+        _pausados.pop(k, None)
+    return bool(quitados)
+
+
+def _pausas_activas():
+    ahora = time.time()
+    return [(k, int((v - ahora) / 60)) for k, v in _pausados.items() if v > ahora]
 
 
 def _headers_meta():
@@ -639,6 +685,20 @@ PLANTILLAS_LUZ = {
         "incluye": "Carrito de compras, turnos online y panel de administración "
                    "(pedidos, turnos, clientes, productos y stock, galería y video).",
     },
+    "lira": {
+        "nombre": "Lira · Salón de Belleza",
+        "precio": "$314.000",
+        "imagenes": [f"{SITIO}/plantillas/peluqueria/03-peluqueria/assets/01-lira.jpg",
+                     f"{SITIO}/plantillas/peluqueria/03-peluqueria/assets/06-lira.jpg"],
+        "demo": f"{SITIO}/plantillas/peluqueria/03-peluqueria/index.html",
+        "estilo": "Editorial y moderna: video en el inicio que se mueve con el mouse, menú a pantalla completa "
+                  "e historias tipo Instagram.",
+        "secciones": "Inicio con video, Galería, Servicios, Tienda con carrito, Quiénes somos, Historias, "
+                     "Reseñas y números, Reservas con calendario, Producto destacado y Preguntas frecuentes.",
+        "incluye": "Carrito de compras, turnos online con calendario y confirmación por WhatsApp, panel de "
+                   "administración (pedidos, turnos, productos y stock) y editor para elegir colores, fotos "
+                   "y textos antes de comprar.",
+    },
 }
 MAX_IMAGENES_POR_RESPUESTA = 2
 
@@ -697,15 +757,13 @@ def datos_del_negocio():
     try:
         conn = get_db()
         # Solo las webs terminadas. Cuando sumes una nueva, agregá su id acá.
-        disponibles = ('peluqueria-aurea', 'peluqueria-lumina')
+        disponibles = ('peluqueria-aurea', 'peluqueria-lumina', 'peluqueria-lira')
         filas = conn.execute(
             f"SELECT nombre, precio, desc_text FROM plantillas WHERE id IN ({','.join('?' * len(disponibles))})",
             disponibles).fetchall()
         conn.close()
         catalogo = "\n".join(f"- {f['nombre']}: {f['precio']} — {f['desc_text']}" for f in filas)
-        catalogo += ("\n- Lira (peluquería): PRÓXIMAMENTE, todavía sin precio. Si preguntan, decí que sale muy pronto "
-                     "y ofrecé avisarle cuando esté.\n"
-                     "Por ahora solo hay webs para peluquerías y salones de belleza. Otros rubros vienen pronto: "
+        catalogo += ("\nPor ahora solo hay webs para peluquerías y salones de belleza. Otros rubros vienen pronto: "
                      "si el cliente tiene otro rubro, contale que se están sumando y usá [DERIVAR: interesado en rubro X].")
     except Exception as error:
         print("No se pudo leer el catálogo:", error)
@@ -759,14 +817,42 @@ REGLAS DE ORO:
 - Si no sabés algo, o el cliente pide algo fuera de lo normal (descuento especial, trabajo a medida, reclamo, problema con un pago, quiere hablar con una persona), respondé algo como "Dejame consultarlo y te confirmo en un ratito 😊" y al FINAL de tu respuesta agregá la etiqueta [DERIVAR: motivo corto]. Esa etiqueta el cliente no la ve.
 - Si te preguntan si sos un bot o una IA, decí la verdad con calidez: sos la asistente virtual de NYMXAR y lo ayudás con todo; si quiere, lo pasás con una persona (y ahí usás [DERIVAR: pide hablar con una persona]).
 - No hables de temas que no tengan que ver con el negocio; volvé amablemente a lo que el cliente necesita.
-- MOSTRAR PLANTILLAS: cuando el cliente quiera ver una web, pregunte cómo es, o diga que le interesa una plantilla, agregá al FINAL de tu respuesta la etiqueta [MOSTRAR: clave] (ej: [MOSTRAR: lumina]). El sistema le manda automáticamente la foto con la ficha (secciones, qué incluye, precio y link a la demo). Por eso tu texto tiene que ser corto, tipo "Te paso cómo es Lumina 👇", sin repetir la ficha. Máximo 2 plantillas por respuesta, y no muestres de nuevo una que ya le mostraste salvo que la pida. Las notas "(Le mostré foto y ficha de: ...)" que ves en tus mensajes anteriores las agrega el sistema: nunca las escribas vos. Si no sabe cuál elegir, preguntale qué estilo le gusta (claro y elegante → Aurea, oscuro y moderno → Lumina) antes de mostrar.
+- MOSTRAR PLANTILLAS: cuando el cliente quiera ver una web, pregunte cómo es, o diga que le interesa una plantilla, agregá al FINAL de tu respuesta la etiqueta [MOSTRAR: clave] (ej: [MOSTRAR: lumina]). El sistema le manda automáticamente la foto con la ficha (secciones, qué incluye, precio y link a la demo). Por eso tu texto tiene que ser corto, tipo "Te paso cómo es Lumina 👇", sin repetir la ficha. Máximo 2 plantillas por respuesta, y no muestres de nuevo una que ya le mostraste salvo que la pida. Las notas "(Le mostré foto y ficha de: ...)" que ves en tus mensajes anteriores las agrega el sistema: nunca las escribas vos. Si no sabe cuál elegir, preguntale qué estilo le gusta (claro y elegante → Aurea, oscuro y moderno → Lumina, editorial con video que se mueve en el inicio → Lira) antes de mostrar.
+- FACTURAS: si alguien que ya compró una web pide factura, pedile (de a una o dos cosas por mensaje): número de pedido (figura en el mail de confirmación y en la página de gracias, ej: #1514), nombre o razón social, CUIT o DNI, condición frente al IVA (consumidor final, monotributista o responsable inscripto) y email. Cuando tengas todo, decile que ya se lo pasás a facturación y que le llega por mail, sin prometer plazos, y al FINAL agregá [FACTURA: número | nombre o razón social | CUIT o DNI | condición IVA | email]. Esa etiqueta el cliente no la ve. No uses [DERIVAR] para esto.
+- MENSAJES AUTOMÁTICOS: si el mensaje claramente no lo escribe una persona interesada en el negocio (promo de una empresa, aviso de banco o tarjeta, código de verificación, publicidad, cadena o algo que parezca estafa), no contestes: tu respuesta completa tiene que ser solo [IGNORAR]. Ante la duda, si parece una persona, contestá normal.
 - Los mensajes que empiezan con [Audio transcripto] son audios que el cliente te mandó. Respondé como si lo hubieras escuchado (nunca digas "transcripción" ni muestres esa etiqueta). Si alguna parte no tiene sentido, preguntá con naturalidad qué quiso decir.
 
 INFORMACIÓN DEL NEGOCIO:
 {datos_del_negocio()}"""
 
 
-def preguntar_a_claude(historial, nombre_agente=None):
+def instruccion_dueno(nombre_agente=None):
+    nombre = nombre_agente or os.environ.get("AGENTE_NOMBRE", "Luz")
+    pausas = _pausas_activas()
+    txt_pausas = "\n".join(f"- +{n} (faltan {m} min)" for n, m in pausas) or "- Ninguno"
+    return f"""Sos {nombre}, la asistente de NYMXAR. Ahora NO estás hablando con un cliente: estás hablando con Noe, la dueña de NYMXAR, que es tu jefa.
+
+CON NOE:
+- No le vendas, no le muestres el catálogo salvo que te lo pida, y nunca uses [DERIVAR], [FACTURA] ni [IGNORAR].
+- Charlás de igual a igual, con confianza y buena onda, mensajes cortos como por WhatsApp. Podés separar en 2 o 3 mensajes con |||.
+- Respondés sus consultas sobre el negocio (catálogo, precios, políticas, cómo atendés a los clientes).
+- Si te explica algo ("eso era una promo de Movistar", "a ese cliente decile tal cosa"), lo tomás en cuenta.
+- Si quiere ver cómo le mostrás una plantilla a un cliente, podés usar [MOSTRAR: clave].
+- Si te pide algo que no podés hacer desde acá (ver todas las charlas, mandar mensajes a otros clientes), decíselo con sinceridad.
+
+COMANDOS QUE ELLA PUEDE USAR (si pregunta, explicaselos):
+- /pausas → lista los chats que están en pausa porque los derivaste.
+- /reanudar 5491112345678 → vuelve a activarte en ese chat.
+- /reset → borra la memoria de su propio chat con vos.
+
+CHATS EN PAUSA AHORA:
+{txt_pausas}
+
+INFORMACIÓN DEL NEGOCIO:
+{datos_del_negocio()}"""
+
+
+def preguntar_a_claude(historial, nombre_agente=None, sistema=None):
     respuesta = requests.post(
         ANTHROPIC_URL,
         headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"],
@@ -774,7 +860,7 @@ def preguntar_a_claude(historial, nombre_agente=None):
                  "content-type": "application/json"},
         json={"model": os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5"),
               "max_tokens": 2000,
-              "system": instruccion_maestra(nombre_agente),
+              "system": sistema or instruccion_maestra(nombre_agente),
               "messages": list(historial)},
         timeout=60,
     )
@@ -784,6 +870,61 @@ def preguntar_a_claude(historial, nombre_agente=None):
     datos = respuesta.json()
     # Solo nos quedamos con el texto (si el modelo "piensa", esos bloques se ignoran).
     return "".join(b.get("text", "") for b in datos.get("content", []) if b.get("type") == "text").strip()
+
+
+def buscar_pedido_web(numero):
+    """Busca un pedido de web en el Supabase de clientes (NEXARG-CLIENTES).
+    Devuelve None si no está configurado o falla; {'existe': False} si no lo encuentra."""
+    url = os.environ.get("CLIENTES_SUPABASE_URL")
+    clave = os.environ.get("CLIENTES_SUPABASE_KEY")
+    if not url or not clave or not numero:
+        return None
+    headers = {"apikey": clave}
+    if not clave.startswith("sb_"):
+        headers["Authorization"] = f"Bearer {clave}"
+    try:
+        r = requests.get(f"{url}/rest/v1/pedidos_personalizacion", headers=headers,
+                         params={"numero": f"eq.{numero}",
+                                 "select": "numero,template,negocio_id,email_cliente"},
+                         timeout=10)
+        r.raise_for_status()
+        filas = r.json()
+        if not filas:
+            return {"existe": False}
+        pedido = filas[0]
+        estado = None
+        if pedido.get("negocio_id"):
+            r2 = requests.get(f"{url}/rest/v1/negocios", headers=headers,
+                              params={"id": f"eq.{pedido['negocio_id']}", "select": "estado"},
+                              timeout=10)
+            if r2.ok and r2.json():
+                estado = r2.json()[0].get("estado")
+        return {"existe": True, "template": pedido.get("template"),
+                "email": pedido.get("email_cliente"), "estado": estado}
+    except Exception as error:
+        print("No se pudo verificar el pedido en Supabase de clientes:", error)
+        return None
+
+
+def avisar_factura(cliente, datos_factura):
+    dueno = os.environ.get("DUENO_WHATSAPP")
+    partes = [p.strip() for p in datos_factura.split("|")]
+    numero = _solo_digitos(partes[0]) if partes else ""
+    pedido = buscar_pedido_web(numero)
+    if pedido is None:
+        verificacion = "❔ No pude verificarlo (revisalo en el admin)"
+    elif not pedido["existe"]:
+        verificacion = "⚠️ No encontré ese número de pedido"
+    else:
+        verificacion = (f"✅ Existe · {pedido.get('template') or 's/plantilla'} · "
+                        f"estado: {pedido.get('estado') or 'sin dato'} · mail compra: {pedido.get('email') or '-'}")
+    etiquetas = ["Pedido", "Nombre / razón social", "CUIT o DNI", "Condición IVA", "Email"]
+    detalle = "\n".join(f"{etiquetas[i]}: {partes[i] if i < len(partes) else '-'}" for i in range(len(etiquetas)))
+    texto_aviso = (f"🧾 Pedido de factura\nCliente: +{cliente}\n{detalle}\n\nVerificación: {verificacion}")
+    if not dueno:
+        print("FACTURA sin DUENO_WHATSAPP configurado:", texto_aviso)
+        return
+    enviar_whatsapp(dueno, texto_aviso)
 
 
 def avisar_al_dueno(cliente, motivo, ultimo_mensaje):
@@ -820,6 +961,25 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
         candado = _candados.setdefault(remitente, threading.Lock())
     with candado:
         try:
+            if es_ignorado(remitente):
+                print(f"Mensaje automático de {remitente}, no respondo.")
+                return
+            dueno = es_dueno(remitente)
+
+            # Comandos de la dueña
+            if dueno and recibido.strip().lower().startswith("/pausas"):
+                pausas = _pausas_activas()
+                enviar_whatsapp(remitente, "\n".join(f"⏸️ +{n} (faltan {m} min)" for n, m in pausas)
+                                or "No hay chats en pausa 👌")
+                return
+            if dueno and recibido.strip().lower().startswith("/reanudar"):
+                numero = _solo_digitos(recibido)
+                if numero and _quitar_pausa(numero):
+                    enviar_whatsapp(remitente, f"▶️ Listo, vuelvo a atender a +{numero}.")
+                else:
+                    enviar_whatsapp(remitente, "No encontré ese chat en pausa. Mandame /pausas para ver la lista.")
+                return
+
             negocio, contacto = _contexto_memoria(remitente, phone_number_id, nombre)
 
             # Comando de prueba: "/reset" borra la memoria y saca la pausa.
@@ -834,7 +994,7 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                 enviar_whatsapp(remitente, "🔄 Memoria borrada. Empecemos de nuevo.")
                 return
 
-            if _pausados.get(remitente, 0) > time.time():
+            if not dueno and _pausados.get(remitente, 0) > time.time():
                 print(f"Chat {remitente} en pausa (lo atiende el dueño).")
                 return
 
@@ -865,12 +1025,36 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                 historial = list(historial_ram)
 
             nombre_agente = negocio.get("nombre_agente") if negocio else None
-            texto_ia = preguntar_a_claude(historial, nombre_agente)
+            sistema = instruccion_dueno(nombre_agente) if dueno else None
+            texto_ia = preguntar_a_claude(historial, nombre_agente, sistema)
             if not texto_ia:
                 if not contacto and historial_ram:
                     historial_ram.pop()
                 enviar_whatsapp(remitente, "Perdón, se me cortó algo 😅 ¿Me lo repetís en un ratito?")
                 return
+
+            # ¿Era un mensaje automático? [IGNORAR] → no se contesta nada.
+            if not dueno and "[IGNORAR" in texto_ia.upper():
+                print(f"Mensaje automático de {remitente} ignorado: {recibido[:120]}")
+                nota = "(Mensaje automático o promo: no respondí)"
+                if contacto:
+                    try:
+                        memoria.guardar_mensaje(negocio["id"], contacto["id"], "assistant", nota)
+                    except Exception as error:
+                        print("No se pudo guardar la nota en Supabase:", error)
+                else:
+                    historial_ram.append({"role": "assistant", "content": nota})
+                return
+            texto_ia = re.sub(r"\[IGNORAR[^\]]*\]", "", texto_ia, flags=re.IGNORECASE).strip()
+
+            # ¿Pidió factura? [FACTURA: numero | nombre | cuit | iva | email]
+            datos_factura = None
+            m_factura = re.search(r"\[FACTURA:\s*([^\]]*)\]", texto_ia)
+            if m_factura:
+                datos_factura = m_factura.group(1).strip()
+            texto_ia = re.sub(r"\[FACTURA:[^\]]*\]", "", texto_ia).strip()
+            if dueno:
+                datos_factura = None
 
             # ¿Pidió derivar al dueño?
             motivo = None
@@ -880,6 +1064,8 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                 etiqueta = texto_ia[inicio:fin + 1] if fin != -1 else texto_ia[inicio:]
                 motivo = etiqueta.strip("[]").replace("DERIVAR", "").strip(" :") or "sin detalle"
                 texto_ia = texto_ia.replace(etiqueta, "").strip()
+            if dueno:
+                motivo = None  # a la dueña nunca se la deriva
 
             # ¿Pidió mostrar plantillas? [MOSTRAR: lumina]
             mostrar = []
@@ -918,6 +1104,9 @@ def responder_con_ia(remitente, recibido, message_id, phone_number_id=None, nomb
                 marcar_leido_y_escribiendo(message_id)
                 time.sleep(1.5)
                 mostrar_plantilla(remitente, clave)
+
+            if datos_factura:
+                avisar_factura(remitente, datos_factura)
 
             if motivo:
                 _pausados[remitente] = time.time() + PAUSA_DERIVACION_SEG
@@ -970,7 +1159,9 @@ def transcribir_audio(contenido, mime_type):
 
 def procesar_audio(remitente, media_id, message_id, phone_number_id=None, nombre=None):
     try:
-        if _pausados.get(remitente, 0) > time.time():
+        if es_ignorado(remitente):
+            return
+        if not es_dueno(remitente) and _pausados.get(remitente, 0) > time.time():
             print(f"Chat {remitente} en pausa (lo atiende el dueño), no transcribo.")
             return
         if not os.environ.get("GROQ_API_KEY"):
@@ -1040,6 +1231,10 @@ def recibir_whatsapp():
                                          args=(remitente, media_id, mid, phone_number_id,
                                                nombres.get(remitente)),
                                          daemon=True).start()
+                    elif mensaje.get("type") in ("reaction", "system", "unsupported", "request_welcome",
+                                                 "interactive", "button") or es_ignorado(remitente):
+                        # Reacciones, avisos del sistema y respuestas a botones de promos: no se contestan.
+                        print(f"Mensaje {mensaje.get('type')} de {remitente} sin respuesta.")
                     else:
                         enviar_whatsapp(remitente, "Por ahora leo mensajes de texto y audios 😊 ¿Me lo escribís?")
     except Exception as error:
