@@ -556,7 +556,7 @@ def cambiar_estado(id):
 #   DUENO_NUMEROS      -> (opcional) otros números tuyos, separados por coma. Con DUENO_WHATSAPP
 #                         forman la lista de "dueña": Luz no les vende ni los deriva, los asiste.
 #   NUMEROS_IGNORAR    -> (opcional) números a los que Luz nunca contesta (promos automáticas),
-#                         separados por coma. Ej: 5491122616666 (promos de Movistar)
+#                         separados por coma, sin + ni espacios.
 #   CLIENTES_SUPABASE_URL -> URL del proyecto NEXARG-CLIENTES (el de las ventas de webs)
 #   CLIENTES_SUPABASE_KEY -> secret key de ESE proyecto. Sirve para verificar pedidos al pedir factura.
 # ------------------------------------------------------------
@@ -606,7 +606,7 @@ def es_dueno(numero):
 def es_ignorado(numero):
     # Remitentes automáticos (promos, bancos...) a los que Luz nunca contesta.
     return normalizar_numero_ar(_solo_digitos(numero)) in _lista_numeros(
-        os.environ.get("NUMEROS_IGNORAR", "5491122616666"))
+        os.environ.get("NUMEROS_IGNORAR", ""))
 
 
 def _quitar_pausa(numero):
